@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["master"]
   pull_request:
-    branches: ["main"]
+    branches: ["master"]
 
 # Zig toolchain version pinned for CI.
 # Keep this in sync with `@required_zig_version` in `lib/quickjs_ex/nif.ex`.
