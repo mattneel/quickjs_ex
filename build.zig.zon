@@ -1,0 +1,15 @@
+.{
+    .name = "quickjs_ex",
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // mitchellh/zig-quickjs-ng pinned at commit b3731c9 (2026-01-04)
+        // Run: zig fetch --save https://github.com/mitchellh/zig-quickjs-ng/archive/b3731c9.tar.gz
+        // to populate the hash field before first `zig build`.
+        .zig_quickjs_ng = .{
+            .url = "https://github.com/mitchellh/zig-quickjs-ng/archive/b3731c9.tar.gz",
+            .hash = "quickjs_ng-0.0.0-0cZnAy6qAwD8ds3qnF6AdDwRpxQYuYswkE4WD0aUaYdg",
+        },
+    },
+    .paths = .{""},
+}

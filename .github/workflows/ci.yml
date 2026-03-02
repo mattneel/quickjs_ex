@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# Zig toolchain version pinned for CI.
+# Keep this in sync with `@required_zig_version` in `lib/quickjs_ex/nif.ex`.
+env:
+  ZIG_VERSION: "0.15.2"
+  ELIXIR_VERSION: "1.19.1"
+  OTP_VERSION: "27"
+
+jobs:
+  # ── First-class: Linux x86_64 ──────────────────────────────────────────────
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang/OTP + Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} (x86_64)
+        run: |
+          ZIG_DIR="$HOME/.local/zig"
+          mkdir -p "$ZIG_DIR"
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" \
+            -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
+          echo "$ZIG_DIR" >> $GITHUB_PATH
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Cache Mix deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-x86_64-mix-${{ hashFiles('mix.lock') }}
+
+      - run: mix deps.get
+      - run: mix compile
+      - run: mix test
+
+  # ── First-class: Linux arm64 ───────────────────────────────────────────────
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang/OTP + Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} (aarch64)
+        run: |
+          ZIG_DIR="$HOME/.local/zig"
+          mkdir -p "$ZIG_DIR"
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-linux-aarch64-$ZIG_VERSION.tar.xz" \
+            -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
+          echo "$ZIG_DIR" >> $GITHUB_PATH
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Cache Mix deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-arm64-mix-${{ hashFiles('mix.lock') }}
+
+      - run: mix deps.get
+      - run: mix compile
+      - run: mix test
+
+  # ── Best-effort: macOS ─────────────────────────────────────────────────────
+  macos:
+    name: macOS (best-effort)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang/OTP + Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} via Homebrew or tarball
+        run: |
+          # macOS aarch64 (Apple Silicon) / x86_64 detected at runtime
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            ZIG_ARCH="macos-aarch64"
+          else
+            ZIG_ARCH="macos-x86_64"
+          fi
+          ZIG_DIR="$HOME/.local/zig"
+          mkdir -p "$ZIG_DIR"
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_ARCH-$ZIG_VERSION.tar.xz" \
+            -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
+          echo "$ZIG_DIR" >> $GITHUB_PATH
+
+      - name: Verify Zig version
+        run: zig version
+
+      - run: mix deps.get
+      - run: mix compile
+      - run: mix test
