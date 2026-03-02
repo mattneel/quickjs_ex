@@ -31,7 +31,7 @@ jobs:
         run: |
           ZIG_DIR="$HOME/.local/zig"
           mkdir -p "$ZIG_DIR"
-          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" \
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
             -o /tmp/zig.tar.xz
           tar -xf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
           echo "$ZIG_DIR" >> $GITHUB_PATH
@@ -66,7 +66,7 @@ jobs:
         run: |
           ZIG_DIR="$HOME/.local/zig"
           mkdir -p "$ZIG_DIR"
-          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-linux-aarch64-$ZIG_VERSION.tar.xz" \
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-linux-$ZIG_VERSION.tar.xz" \
             -o /tmp/zig.tar.xz
           tar -xf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
           echo "$ZIG_DIR" >> $GITHUB_PATH
@@ -103,9 +103,9 @@ jobs:
           # macOS aarch64 (Apple Silicon) / x86_64 detected at runtime
           ARCH=$(uname -m)
           if [ "$ARCH" = "arm64" ]; then
-            ZIG_ARCH="macos-aarch64"
+            ZIG_ARCH="aarch64-macos"
           else
-            ZIG_ARCH="macos-x86_64"
+            ZIG_ARCH="x86_64-macos"
           fi
           ZIG_DIR="$HOME/.local/zig"
           mkdir -p "$ZIG_DIR"
