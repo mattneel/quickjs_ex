@@ -344,7 +344,7 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
         return beam.make(.{ .@"error", .poisoned }, .{});
     }
 
-    if (!is_owner_or_runner(env, ctx_res)) {
+    if (!is_owner(env, ctx_res.owner_pid)) {
         return beam.make(.{ .@"error", .not_owner }, .{});
     }
 
@@ -453,7 +453,7 @@ pub fn nif_get(resource_ref: beam.term, name: []const u8) beam.term {
         return beam.make(.{ .@"error", .poisoned }, .{});
     }
 
-    if (!is_owner_or_runner(env, ctx_res)) {
+    if (!is_owner(env, ctx_res.owner_pid)) {
         return beam.make(.{ .@"error", .not_owner }, .{});
     }
 
@@ -499,7 +499,7 @@ pub fn nif_set_value(resource_ref: beam.term, name: []const u8, value: beam.term
         return beam.make(.{ .@"error", .poisoned }, .{});
     }
 
-    if (!is_owner_or_runner(env, ctx_res)) {
+    if (!is_owner(env, ctx_res.owner_pid)) {
         return beam.make(.{ .@"error", .not_owner }, .{});
     }
 
@@ -537,7 +537,7 @@ pub fn nif_set_path(resource_ref: beam.term, path: [][]const u8, value: beam.ter
         return beam.make(.{ .@"error", .poisoned }, .{});
     }
 
-    if (!is_owner_or_runner(env, ctx_res)) {
+    if (!is_owner(env, ctx_res.owner_pid)) {
         return beam.make(.{ .@"error", .not_owner }, .{});
     }
 

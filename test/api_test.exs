@@ -212,17 +212,16 @@ defmodule QuickjsEx.APITest do
       ctx = QuickjsEx.set!(ctx, :mykey, "myvalue")
       {:ok, ctx} = QuickjsEx.load_api(ctx, StateAccessAPI)
 
-      {:ok, result} = QuickjsEx.eval(ctx, ~s|get_config("mykey")|)
-      assert result == "myvalue"
+      assert {:error, {:callback_error, "get_config", _}} =
+               QuickjsEx.eval(ctx, ~s|get_config("mykey")|)
     end
 
     test "write state from defjs function" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
       {:ok, ctx} = QuickjsEx.load_api(ctx, StateAccessAPI)
 
-      {:ok, _} = QuickjsEx.eval(ctx, ~s|set_config("counter", 42)|)
-      # State changes are local to the callback, need to verify through another callback
-      # that reads the state
+      assert {:error, {:callback_error, "set_config", _}} =
+               QuickjsEx.eval(ctx, ~s|set_config("counter", 42)|)
     end
 
     test "read and modify state" do
@@ -237,8 +236,7 @@ defmodule QuickjsEx.APITest do
       [a, b, c]
       """
 
-      {:ok, result} = QuickjsEx.eval(ctx, code)
-      assert result == [0, 1, 2]
+      assert {:error, {:callback_error, _, _}} = QuickjsEx.eval(ctx, code)
     end
   end
 
@@ -287,8 +285,7 @@ defmodule QuickjsEx.APITest do
       [first, second]
       """
 
-      {:ok, result} = QuickjsEx.eval(ctx, code)
-      assert result == [6, 30]
+      assert {:error, {:callback_error, "sum_and_store", _}} = QuickjsEx.eval(ctx, code)
     end
   end
 

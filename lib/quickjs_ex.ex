@@ -89,11 +89,18 @@ defmodule QuickjsEx do
           |> put_private(:__runner_pid__, runner_pid)
           |> sync_poisoned_context()
 
-        :ok = NIF.nif_set_callback_runner(ref, runner_pid)
-        maybe_bootstrap_runtime(ref, memory_limit)
-        {:ok, ctx}
+        case NIF.nif_set_callback_runner(ref, runner_pid) do
+          :ok ->
+            maybe_bootstrap_runtime(ref, memory_limit)
+            {:ok, ctx}
+
+          {:error, reason} ->
+            send(runner_pid, :stop)
+            {:error, normalise_error(reason)}
+        end
 
       {:error, reason} ->
+        send(runner_pid, :stop)
         {:error, normalise_error(reason)}
     end
   end
@@ -319,15 +326,15 @@ defmodule QuickjsEx do
       name_str = to_string(name)
       runner_pid = get_private!(ctx, :__runner_pid__)
 
-      callback_ctx =
-        ctx
-        |> Context.put_callback(name_str, fun)
-        |> sync_poisoned_context()
-
-      :ok = CallbackRunner.register(runner_pid, name_str, fun, callback_ctx)
-
       case NIF.nif_register_callback(ctx.ref, name_str, nil) do
         :ok ->
+          :ok = CallbackRunner.register(runner_pid, name_str, fun)
+
+          callback_ctx =
+            ctx
+            |> Context.put_callback(name_str, fun)
+            |> sync_poisoned_context()
+
           {:ok, callback_ctx}
 
         {:error, raw_reason} ->
@@ -646,6 +653,15 @@ defmodule QuickjsEx do
 
   defp build_callback_path(scope, name), do: scope ++ [to_string(name)]
 
+  defp build_callback_fun(_module, name, true, _variadic) do
+    fn _args ->
+      raise QuickjsEx.RuntimeException,
+            {:callback_error, to_string(name),
+             "stateful defjs callbacks (with state parameter) are not supported in v0.1; " <>
+               "use QuickjsEx.get_private/put_private for shared state instead"}
+    end
+  end
+
   defp build_callback_fun(module, name, false, false) do
     fn args ->
       apply(module, name, args)
@@ -655,18 +671,6 @@ defmodule QuickjsEx do
   defp build_callback_fun(module, name, false, true) do
     fn args ->
       apply(module, name, [args])
-    end
-  end
-
-  defp build_callback_fun(module, name, true, false) do
-    fn args, callback_ctx ->
-      apply(module, name, args ++ [callback_ctx])
-    end
-  end
-
-  defp build_callback_fun(module, name, true, true) do
-    fn args, callback_ctx ->
-      apply(module, name, [args, callback_ctx])
     end
   end
 
@@ -790,7 +794,7 @@ defmodule QuickjsEx do
   defp normalise_error(:not_owner), do: :not_owner
   defp normalise_error(:sandbox), do: :sandbox_violation
   defp normalise_error(:async), do: :async_not_supported
-  defp normalise_error(:internal_error), do: :internal_error
+  defp normalise_error(:internal), do: :internal_error
   defp normalise_error({:js, message}), do: {:js_error, message}
   defp normalise_error({:cb, name, message}), do: {:callback_error, name, message}
   defp normalise_error({:invalid_module, message}), do: {:invalid_api_module, message}
