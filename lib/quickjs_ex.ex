@@ -197,6 +197,35 @@ defmodule QuickjsEx do
   end
 
   @doc """
+  Returns coarse gas accounting for the context.
+
+  Gas is measured in QuickJS interrupt quanta, not exact VM instructions.
+  One quantum currently corresponds to `10_000` internal interrupt-counted
+  instructions in the vendored QuickJS-NG runtime. `last` is the most recent
+  completed evaluation cost, with a minimum of `1` for any completed eval.
+
+  ## Returns
+
+  - `{:ok, %{last: integer, total: integer, quantum: integer}}` on success.
+  - `{:error, reason}` on failure, using the same normalized error set as `eval/3`.
+  """
+  def gas(%Context{} = ctx) do
+    if context_poisoned?(ctx) do
+      {:error, :context_poisoned}
+    else
+      case NIF.nif_get_gas(ctx.ref) do
+        {:ok, _gas} = ok ->
+          ok
+
+        {:error, raw_reason} ->
+          reason = normalise_error(raw_reason)
+          _ = track_poisoned_error(ctx, reason)
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
   Reads a JavaScript global value by name.
 
   `name` can be an atom or string.

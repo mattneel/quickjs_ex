@@ -10,6 +10,7 @@ const Atom = zig_quickjs_ng.Atom;
 const c = zig_quickjs_ng.c;
 
 const MAX_MARSHAL_DEPTH: u32 = 100;
+const INTERRUPT_GAS_QUANTUM: u64 = 10_000;
 
 pub const JsContext = struct {
     runtime_ptr: usize,
@@ -30,6 +31,8 @@ pub const JsContext = struct {
     callback_error: ?beam.term,
     self_resource_env: beam.env,
     self_resource_term: e.ErlNifTerm,
+    gas_quanta_total: u64,
+    gas_quanta_last: u64,
 };
 
 fn runtime_ptr(ctx_res: *JsContext) *Runtime {
@@ -249,6 +252,7 @@ fn interrupt_handler(opaque_ptr: ?*JsContext, runtime: *Runtime) bool {
     _ = runtime;
 
     const ctx_res = opaque_ptr orelse return false;
+    ctx_res.gas_quanta_total +|= 1;
     if (ctx_res.deadline_ms == 0) return false;
     if (ctx_res.deadline_ms > @as(u64, @intCast(std.math.maxInt(i64)))) return false;
 
@@ -311,6 +315,8 @@ pub fn nif_new(memory_limit_bytes: u64, stack_limit_bytes: u64, timeout_ms: u64)
         .callback_error = null,
         .self_resource_env = null,
         .self_resource_term = undefined,
+        .gas_quanta_total = 0,
+        .gas_quanta_last = 0,
     }, .{}) catch {
         return beam.make(.{ .@"error", .internal_error }, .{});
     };
@@ -387,6 +393,12 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
     @memcpy(code_copy[0..code.len], code);
     code_copy[code.len] = 0;
 
+    const gas_start = ctx_res.gas_quanta_total;
+    defer {
+        const gas_delta = ctx_res.gas_quanta_total - gas_start;
+        ctx_res.gas_quanta_last = if (gas_delta == 0) 1 else gas_delta;
+    }
+
     const result = ctx.eval(code_copy[0..code.len], "<eval>", .{});
     defer result.deinit(ctx);
 
@@ -438,6 +450,32 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
     };
 
     return beam.make(.{ .ok, erl_term }, .{});
+}
+
+pub fn nif_get_gas(resource_ref: beam.term) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{});
+    };
+    defer ctx_resource.release();
+    const ctx_res = ctx_resource.__payload;
+
+    if (ctx_res.poisoned) {
+        return beam.make(.{ .@"error", .poisoned }, .{});
+    }
+
+    if (!is_owner(env, ctx_res.owner_pid)) {
+        return beam.make(.{ .@"error", .not_owner }, .{});
+    }
+
+    const gas = beam.make(.{
+        .last = ctx_res.gas_quanta_last,
+        .total = ctx_res.gas_quanta_total,
+        .quantum = INTERRUPT_GAS_QUANTUM,
+    }, .{});
+
+    return beam.make(.{ .ok, gas }, .{});
 }
 
 pub fn nif_get(resource_ref: beam.term, name: []const u8) beam.term {

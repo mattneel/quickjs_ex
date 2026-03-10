@@ -14,7 +14,28 @@ defmodule QuickjsExTest do
       assert :ok = QuickjsEx.NIF.nif_set_value(ref, "x", 41)
       assert {:ok, 41} = QuickjsEx.NIF.nif_get(ref, "x")
       assert {:ok, 42} = QuickjsEx.NIF.nif_eval(ref, "x + 1", 0)
+      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} = QuickjsEx.NIF.nif_get_gas(ref)
       assert :ok = QuickjsEx.NIF.nif_gc(ref)
+    end
+
+    test "raw NIF gas tracks heavier evaluations" do
+      assert {:ok, ref} = QuickjsEx.NIF.nif_new(@default_memory, 0, 0)
+
+      assert {:ok, 2} = QuickjsEx.NIF.nif_eval(ref, "1 + 1", 0)
+      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} = QuickjsEx.NIF.nif_get_gas(ref)
+
+      assert {:ok, _} =
+               QuickjsEx.NIF.nif_eval(
+                 ref,
+                 "let s = 0; for (let i = 0; i < 500000; i++) { s += i; } s",
+                 0
+               )
+
+      assert {:ok, %{last: last, total: total, quantum: 10_000}} =
+               QuickjsEx.NIF.nif_get_gas(ref)
+
+      assert last > 1
+      assert total >= last
     end
   end
 
@@ -102,6 +123,23 @@ defmodule QuickjsExTest do
 
       :erlang.garbage_collect()
       assert true
+    end
+
+    test "gas reports coarse evaluation cost" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:ok, 2} = QuickjsEx.eval(ctx, "1 + 1")
+      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} = QuickjsEx.gas(ctx)
+
+      assert {:ok, _} =
+               QuickjsEx.eval(
+                 ctx,
+                 "let s = 0; for (let i = 0; i < 500000; i++) { s += i; } s"
+               )
+
+      assert {:ok, %{last: last, total: total, quantum: 10_000}} = QuickjsEx.gas(ctx)
+      assert last > 1
+      assert total >= last
     end
   end
 

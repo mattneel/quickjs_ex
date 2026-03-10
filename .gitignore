@@ -26,3 +26,6 @@ quickjs_ex-*.tar
 priv/lib/*.so*
 priv/lib/*.dylib*
 priv/lib/*.dll*
+
+# Zigler-generated source mirrors.
+**/.Elixir*.NIF.zig

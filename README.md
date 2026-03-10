@@ -136,6 +136,20 @@ Security validation:
 - Recreate required: `:oom` and `:internal_error`.
 - If a call returns `:context_poisoned`, the context has already entered a non-recoverable state and must be recreated.
 
+## Gas accounting
+
+Use `QuickjsEx.gas/1` to read coarse runtime cost for the current context:
+
+```elixir
+{:ok, ctx} = QuickjsEx.new()
+{:ok, _result} = QuickjsEx.eval(ctx, "1 + 1")
+{:ok, %{last: 1, total: 1, quantum: 10_000}} = QuickjsEx.gas(ctx)
+```
+
+Gas is reported in interrupt quanta, not exact VM instructions. One quantum currently
+represents `10_000` internal QuickJS interrupt-counted instructions, which makes it
+useful as a deterministic billing or budgeting baseline even before deeper pricing sweeps.
+
 ## Platform support
 
 | Platform | Support |

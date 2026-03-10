@@ -107,6 +107,7 @@ defmodule QuickjsEx.NIF do
       ping: [],
       nif_new: [:dirty_cpu],
       nif_eval: [:dirty_cpu],
+      nif_get_gas: [],
       nif_get: [],
       nif_set_value: [],
       nif_set_path: [],
