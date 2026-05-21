@@ -15,9 +15,19 @@ defmodule QuickjsEx do
   ## See also
 
   For structured API modules, macros, and install hooks, see `QuickjsEx.API`.
+
+  ## Execution model
+
+  Each context owns one dedicated OS thread for its QuickJS runtime and context.
+  Runtime-touching NIF calls enqueue work to that thread and return immediately;
+  public APIs wait in Elixir for a ref-tagged result message.
+
+  JavaScript callbacks are serviced by the caller's receive loop while it waits
+  for the result. Blocking callback work therefore parks the caller process and
+  the context thread, not a BEAM dirty scheduler. Evaluation timeout and gas
+  accounting exclude time spent waiting for host callbacks.
   """
 
-  alias QuickjsEx.CallbackRunner
   alias QuickjsEx.Context
   alias QuickjsEx.NIF
   alias QuickjsEx.RuntimeException
@@ -57,6 +67,7 @@ defmodule QuickjsEx do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -77,8 +88,6 @@ defmodule QuickjsEx do
     stack_limit = Keyword.get(opts, :stack_limit, @default_stack_limit)
     timeout = Keyword.get(opts, :timeout, 0)
 
-    {:ok, runner_pid} = CallbackRunner.start_link()
-
     case NIF.nif_new(memory_limit, stack_limit, timeout) do
       {:ok, ref} ->
         clear_poisoned_ref(ref)
@@ -86,21 +95,12 @@ defmodule QuickjsEx do
         ctx =
           ref
           |> Context.new()
-          |> put_private(:__runner_pid__, runner_pid)
           |> sync_poisoned_context()
 
-        case NIF.nif_set_callback_runner(ref, runner_pid) do
-          :ok ->
-            maybe_bootstrap_runtime(ref, memory_limit)
-            {:ok, ctx}
-
-          {:error, reason} ->
-            send(runner_pid, :stop)
-            {:error, normalise_error(reason)}
-        end
+        maybe_bootstrap_runtime(ctx, memory_limit)
+        {:ok, ctx}
 
       {:error, reason} ->
-        send(runner_pid, :stop)
         {:error, normalise_error(reason)}
     end
   end
@@ -123,6 +123,7 @@ defmodule QuickjsEx do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -147,7 +148,12 @@ defmodule QuickjsEx do
     else
       timeout = Keyword.get(opts, :timeout, 0)
 
-      case NIF.nif_eval(ctx.ref, code, timeout) do
+      request_ref = make_ref()
+
+      case NIF.nif_eval(ctx.ref, request_ref, code, timeout) do
+        :ok ->
+          await_eval_result(ctx, request_ref)
+
         {:ok, _result} = ok ->
           ok
 
@@ -213,7 +219,12 @@ defmodule QuickjsEx do
     if context_poisoned?(ctx) do
       {:error, :context_poisoned}
     else
-      case NIF.nif_get_gas(ctx.ref) do
+      request_ref = make_ref()
+
+      case NIF.nif_get_gas(ctx.ref, request_ref) do
+        :ok ->
+          await_simple_result(ctx, request_ref)
+
         {:ok, _gas} = ok ->
           ok
 
@@ -238,6 +249,7 @@ defmodule QuickjsEx do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -259,7 +271,12 @@ defmodule QuickjsEx do
     if context_poisoned?(ctx) do
       {:error, :context_poisoned}
     else
-      case NIF.nif_get(ctx.ref, to_string(name)) do
+      request_ref = make_ref()
+
+      case NIF.nif_get(ctx.ref, request_ref, to_string(name)) do
+        :ok ->
+          await_simple_result(ctx, request_ref)
+
         {:ok, _value} = ok ->
           ok
 
@@ -322,6 +339,7 @@ defmodule QuickjsEx do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -353,18 +371,24 @@ defmodule QuickjsEx do
       {:error, :context_poisoned}
     else
       name_str = to_string(name)
-      runner_pid = get_private!(ctx, :__runner_pid__)
 
-      case NIF.nif_register_callback(ctx.ref, name_str, nil) do
+      request_ref = make_ref()
+
+      case NIF.nif_register_callback(ctx.ref, request_ref, name_str, nil) do
         :ok ->
-          :ok = CallbackRunner.register(runner_pid, name_str, fun)
+          case await_simple_result(ctx, request_ref) do
+            :ok ->
+              callback_ctx =
+                ctx
+                |> Context.put_callback(name_str, fun)
+                |> sync_poisoned_context()
 
-          callback_ctx =
-            ctx
-            |> Context.put_callback(name_str, fun)
-            |> sync_poisoned_context()
+              {:ok, callback_ctx}
 
-          {:ok, callback_ctx}
+            {:error, reason} ->
+              _ = track_poisoned_error(ctx, reason)
+              {:error, reason}
+          end
 
         {:error, raw_reason} ->
           reason = normalise_error(raw_reason)
@@ -378,9 +402,18 @@ defmodule QuickjsEx do
     if context_poisoned?(ctx) do
       {:error, :context_poisoned}
     else
-      case NIF.nif_set_value(ctx.ref, to_string(name), value) do
+      request_ref = make_ref()
+
+      case NIF.nif_set_value(ctx.ref, request_ref, to_string(name), value) do
         :ok ->
-          {:ok, sync_poisoned_context(ctx)}
+          case await_simple_result(ctx, request_ref) do
+            :ok ->
+              {:ok, sync_poisoned_context(ctx)}
+
+            {:error, reason} ->
+              _ = track_poisoned_error(ctx, reason)
+              {:error, reason}
+          end
 
         {:error, raw_reason} ->
           reason = normalise_error(raw_reason)
@@ -395,10 +428,18 @@ defmodule QuickjsEx do
       {:error, :context_poisoned}
     else
       path_segments = Enum.map(path, &to_string/1)
+      request_ref = make_ref()
 
-      case NIF.nif_set_path(ctx.ref, path_segments, value) do
+      case NIF.nif_set_path(ctx.ref, request_ref, path_segments, value) do
         :ok ->
-          {:ok, sync_poisoned_context(ctx)}
+          case await_simple_result(ctx, request_ref) do
+            :ok ->
+              {:ok, sync_poisoned_context(ctx)}
+
+            {:error, reason} ->
+              _ = track_poisoned_error(ctx, reason)
+              {:error, reason}
+          end
 
         {:error, raw_reason} ->
           reason = normalise_error(raw_reason)
@@ -454,6 +495,7 @@ defmodule QuickjsEx do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -549,6 +591,7 @@ defmodule QuickjsEx do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -569,9 +612,11 @@ defmodule QuickjsEx do
     if context_poisoned?(ctx) do
       {:error, :context_poisoned}
     else
-      case NIF.nif_gc(ctx.ref) do
+      request_ref = make_ref()
+
+      case NIF.nif_gc(ctx.ref, request_ref) do
         :ok ->
-          :ok
+          await_simple_result(ctx, request_ref)
 
         {:error, raw_reason} ->
           reason = normalise_error(raw_reason)
@@ -680,6 +725,85 @@ defmodule QuickjsEx do
     %{ctx | private: Map.delete(ctx.private, key)}
   end
 
+  defp await_eval_result(%Context{} = ctx, request_ref) do
+    case await_nif_result(ctx, request_ref) do
+      {:ok, _result} = ok ->
+        ok
+
+      {:error, raw_reason} ->
+        reason =
+          raw_reason
+          |> normalise_error()
+          |> remap_callback_alias(ctx)
+
+        _ = track_poisoned_error(ctx, reason)
+        {:error, reason}
+    end
+  end
+
+  defp await_simple_result(%Context{} = ctx, request_ref) do
+    case await_nif_result(ctx, request_ref) do
+      {:error, raw_reason} ->
+        reason = normalise_error(raw_reason)
+        _ = track_poisoned_error(ctx, reason)
+        {:error, reason}
+
+      other ->
+        other
+    end
+  end
+
+  defp await_nif_result(%Context{} = ctx, request_ref) do
+    receive do
+      {:quickjs_ex_result, ^request_ref, result} ->
+        result
+
+      {:quickjs_ex_callback, ^request_ref, req_id, callback_name, args} ->
+        result = run_callback(ctx, callback_name, args)
+        _ = NIF.nif_signal_callback_result(ctx.ref, request_ref, req_id, result)
+        await_nif_result(ctx, request_ref)
+    end
+  end
+
+  defp run_callback(%Context{} = ctx, callback_name, args) do
+    callback_name = to_string(callback_name)
+
+    case Map.fetch(ctx.callbacks, callback_name) do
+      {:ok, fun} ->
+        invoke_callback(callback_name, fun, args)
+
+      :error ->
+        {:error, {:cb, callback_name, "callback not registered"}}
+    end
+  end
+
+  defp invoke_callback(callback_name, fun, args) do
+    case :erlang.fun_info(fun, :arity) do
+      {:arity, 1} ->
+        try do
+          case fun.(args) do
+            {:error, reason} -> {:error, {:cb, callback_name, callback_error_message(reason)}}
+            callback_result -> {:ok, callback_result}
+          end
+        rescue
+          exception ->
+            {:error, {:cb, callback_name, Exception.message(exception)}}
+        catch
+          kind, reason ->
+            {:error, {:cb, callback_name, Exception.format(kind, reason, __STACKTRACE__)}}
+        end
+
+      {:arity, _arity} ->
+        {:error,
+         {:cb, callback_name,
+          "stateful callbacks must use defjs with state parameter - state access is not supported from callback bridge"}}
+    end
+  end
+
+  defp callback_error_message(reason) when is_binary(reason), do: reason
+  defp callback_error_message(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp callback_error_message(reason), do: inspect(reason)
+
   defp build_callback_path(scope, name), do: scope ++ [to_string(name)]
 
   defp build_callback_fun(_module, name, true, _variadic) do
@@ -787,13 +911,13 @@ defmodule QuickjsEx do
     "\"#{escaped}\""
   end
 
-  defp maybe_bootstrap_runtime(ref, memory_limit)
+  defp maybe_bootstrap_runtime(ctx, memory_limit)
        when is_integer(memory_limit) and memory_limit >= @bootstrap_min_memory do
-    _ = NIF.nif_eval(ref, @runtime_bootstrap, 0)
+    _ = eval(ctx, @runtime_bootstrap)
     :ok
   end
 
-  defp maybe_bootstrap_runtime(_ref, _memory_limit), do: :ok
+  defp maybe_bootstrap_runtime(_ctx, _memory_limit), do: :ok
 
   defp remember_callback_alias(%Context{} = ctx, callback_name, public_name) do
     aliases =
@@ -821,6 +945,7 @@ defmodule QuickjsEx do
   defp normalise_error(:oom), do: :oom
   defp normalise_error(:poisoned), do: :context_poisoned
   defp normalise_error(:not_owner), do: :not_owner
+  defp normalise_error(:context_busy), do: :context_busy
   defp normalise_error(:sandbox), do: :sandbox_violation
   defp normalise_error(:async), do: :async_not_supported
   defp normalise_error(:internal), do: :internal_error

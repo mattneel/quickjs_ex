@@ -10,6 +10,7 @@ defmodule QuickjsEx.RuntimeException do
     - `:oom`
     - `:context_poisoned`
     - `:not_owner`
+    - `:context_busy`
     - `:sandbox_violation`
     - `:async_not_supported`
     - `:internal_error`
@@ -65,6 +66,13 @@ defmodule QuickjsEx.RuntimeException do
         %__MODULE__{
           message: "Current process does not own this JavaScript context",
           category: :not_owner,
+          detail: nil
+        }
+
+      :context_busy ->
+        %__MODULE__{
+          message: "JavaScript context is already running a command",
+          category: :context_busy,
           detail: nil
         }
 

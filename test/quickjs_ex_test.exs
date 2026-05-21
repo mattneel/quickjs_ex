@@ -3,6 +3,43 @@ defmodule QuickjsExTest do
 
   @default_memory 256 * 1024
 
+  defp await_raw_result(ctx_ref, request_ref, callbacks) do
+    receive do
+      {:quickjs_ex_result, ^request_ref, result} ->
+        result
+
+      {:quickjs_ex_callback, ^request_ref, req_id, callback_name, args} ->
+        result =
+          case Map.fetch(callbacks, callback_name) do
+            {:ok, fun} ->
+              try do
+                {:ok, fun.(args)}
+              rescue
+                exception -> {:error, {:cb, callback_name, Exception.message(exception)}}
+              catch
+                kind, reason ->
+                  {:error, {:cb, callback_name, Exception.format(kind, reason, __STACKTRACE__)}}
+              end
+
+            :error ->
+              {:error, {:cb, callback_name, "callback not registered"}}
+          end
+
+        assert :ok =
+                 QuickjsEx.NIF.nif_signal_callback_result(ctx_ref, request_ref, req_id, result)
+
+        await_raw_result(ctx_ref, request_ref, callbacks)
+    after
+      2_000 -> flunk("raw NIF request did not reply")
+    end
+  end
+
+  defp dispatch_raw(ctx_ref, fun, callbacks \\ %{}) do
+    request_ref = make_ref()
+    assert :ok = fun.(request_ref)
+    await_raw_result(ctx_ref, request_ref, callbacks)
+  end
+
   describe "NIF smoke tests" do
     test "ping responds from the NIF" do
       assert :ok = QuickjsEx.NIF.ping()
@@ -11,28 +48,37 @@ defmodule QuickjsExTest do
     test "raw NIF context supports eval/get/set/gc" do
       assert {:ok, ref} = QuickjsEx.NIF.nif_new(@default_memory, 0, 0)
 
-      assert :ok = QuickjsEx.NIF.nif_set_value(ref, "x", 41)
-      assert {:ok, 41} = QuickjsEx.NIF.nif_get(ref, "x")
-      assert {:ok, 42} = QuickjsEx.NIF.nif_eval(ref, "x + 1", 0)
-      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} = QuickjsEx.NIF.nif_get_gas(ref)
-      assert :ok = QuickjsEx.NIF.nif_gc(ref)
+      assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_set_value(ref, &1, "x", 41))
+      assert {:ok, 41} = dispatch_raw(ref, &QuickjsEx.NIF.nif_get(ref, &1, "x"))
+      assert {:ok, 42} = dispatch_raw(ref, &QuickjsEx.NIF.nif_eval(ref, &1, "x + 1", 0))
+
+      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} =
+               dispatch_raw(ref, &QuickjsEx.NIF.nif_get_gas(ref, &1))
+
+      assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_gc(ref, &1))
     end
 
     test "raw NIF gas tracks heavier evaluations" do
       assert {:ok, ref} = QuickjsEx.NIF.nif_new(@default_memory, 0, 0)
 
-      assert {:ok, 2} = QuickjsEx.NIF.nif_eval(ref, "1 + 1", 0)
-      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} = QuickjsEx.NIF.nif_get_gas(ref)
+      assert {:ok, 2} = dispatch_raw(ref, &QuickjsEx.NIF.nif_eval(ref, &1, "1 + 1", 0))
+
+      assert {:ok, %{last: 1, total: 1, quantum: 10_000}} =
+               dispatch_raw(ref, &QuickjsEx.NIF.nif_get_gas(ref, &1))
 
       assert {:ok, _} =
-               QuickjsEx.NIF.nif_eval(
+               dispatch_raw(
                  ref,
-                 "let s = 0; for (let i = 0; i < 500000; i++) { s += i; } s",
-                 0
+                 &QuickjsEx.NIF.nif_eval(
+                   ref,
+                   &1,
+                   "let s = 0; for (let i = 0; i < 500000; i++) { s += i; } s",
+                   0
+                 )
                )
 
       assert {:ok, %{last: last, total: total, quantum: 10_000}} =
-               QuickjsEx.NIF.nif_get_gas(ref)
+               dispatch_raw(ref, &QuickjsEx.NIF.nif_get_gas(ref, &1))
 
       assert last > 1
       assert total >= last
@@ -42,33 +88,44 @@ defmodule QuickjsExTest do
   describe "callback bridge" do
     setup do
       {:ok, ref} = QuickjsEx.NIF.nif_new(@default_memory, 0, 0)
-      {:ok, runner_pid} = QuickjsEx.CallbackRunner.start_link()
-      assert :ok = QuickjsEx.NIF.nif_set_callback_runner(ref, runner_pid)
-
-      on_exit(fn ->
-        send(runner_pid, :stop)
-      end)
-
-      %{ref: ref, runner_pid: runner_pid}
+      %{ref: ref}
     end
 
-    test "routes JS callback invocation through callback runner", %{
-      ref: ref,
-      runner_pid: runner_pid
-    } do
-      assert :ok = QuickjsEx.CallbackRunner.register(runner_pid, "double", fn [x] -> x * 2 end)
-      assert :ok = QuickjsEx.NIF.nif_register_callback(ref, "double", nil)
-      assert {:ok, 42} = QuickjsEx.NIF.nif_eval(ref, "double(21)", 0)
+    test "routes JS callback invocation through the caller receive loop", %{ref: ref} do
+      assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_register_callback(ref, &1, "double", nil))
+
+      assert {:ok, 42} =
+               dispatch_raw(
+                 ref,
+                 &QuickjsEx.NIF.nif_eval(ref, &1, "double(21)", 0),
+                 %{"double" => fn [x] -> x * 2 end}
+               )
     end
 
-    test "propagates callback failures over the bridge", %{ref: ref, runner_pid: runner_pid} do
-      assert :ok =
-               QuickjsEx.CallbackRunner.register(runner_pid, "fail", fn [] ->
-                 raise "intentional error"
-               end)
+    test "propagates callback failures over the bridge", %{ref: ref} do
+      assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_register_callback(ref, &1, "fail", nil))
 
-      assert :ok = QuickjsEx.NIF.nif_register_callback(ref, "fail", nil)
-      assert {:error, {:cb, "fail", _}} = QuickjsEx.NIF.nif_eval(ref, "fail()", 0)
+      assert {:error, {:cb, "fail", _}} =
+               dispatch_raw(
+                 ref,
+                 &QuickjsEx.NIF.nif_eval(ref, &1, "fail()", 0),
+                 %{"fail" => fn [] -> raise "intentional error" end}
+               )
+    end
+
+    test "rejects callback results tagged with the wrong request ref", %{ref: ref} do
+      assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_register_callback(ref, &1, "double", nil))
+
+      request_ref = make_ref()
+      assert :ok = QuickjsEx.NIF.nif_eval(ref, request_ref, "double(21)", 0)
+
+      assert_receive {:quickjs_ex_callback, ^request_ref, req_id, "double", [21]}, 1_000
+
+      assert {:error, :stale} =
+               QuickjsEx.NIF.nif_signal_callback_result(ref, make_ref(), req_id, {:ok, 42})
+
+      assert :ok = QuickjsEx.NIF.nif_signal_callback_result(ref, request_ref, req_id, {:ok, 42})
+      assert_receive {:quickjs_ex_result, ^request_ref, {:ok, 42}}, 1_000
     end
   end
 
@@ -786,6 +843,114 @@ defmodule QuickjsExTest do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
       assert {:ok, 4} = QuickjsEx.eval(ctx, "2 + 2", timeout: 0)
     end
+
+    test "timeout measures JavaScript execution and excludes callback wait time" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      ctx =
+        QuickjsEx.set!(ctx, :blocking_host_io, fn [] ->
+          Process.sleep(200)
+          41
+        end)
+
+      assert {:ok, 42} =
+               QuickjsEx.eval(ctx, "blocking_host_io() + 1", timeout: 50)
+    end
+  end
+
+  describe "scheduler-safe blocking callbacks" do
+    test "callbacks run in the caller process" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+      Process.put(:quickjs_ex_callback_state, "caller-state")
+
+      ctx =
+        QuickjsEx.set!(ctx, :read_process_state, fn [] ->
+          Process.get(:quickjs_ex_callback_state)
+        end)
+
+      assert {:ok, "caller-state"} = QuickjsEx.eval(ctx, "read_process_state()")
+    after
+      Process.delete(:quickjs_ex_callback_state)
+    end
+
+    test "blocking callbacks do not consume dirty CPU schedulers" do
+      dirty_schedulers = :erlang.system_info(:dirty_cpu_schedulers_online)
+      context_count = dirty_schedulers + 2
+      parent = self()
+
+      tasks =
+        for index <- 1..context_count do
+          Task.async(fn ->
+            {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+            ctx =
+              QuickjsEx.set!(ctx, :blocking_host_io, fn [] ->
+                Process.sleep(500)
+                index
+              end)
+
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              1_000 -> flunk("context #{index} did not receive start signal")
+            end
+
+            QuickjsEx.eval(ctx, "blocking_host_io()")
+          end)
+        end
+
+      ready_pids =
+        for _ <- 1..context_count do
+          assert_receive {:ready, pid}, 5_000
+          pid
+        end
+
+      responsiveness_task =
+        Task.async(fn ->
+          Enum.reduce(1..50_000, 0, &+/2)
+        end)
+
+      start = System.monotonic_time(:millisecond)
+      Enum.each(ready_pids, &send(&1, :go))
+
+      assert Task.await(responsiveness_task, 100) == div(50_000 * 50_001, 2)
+      assert Enum.map(tasks, &Task.await(&1, 2_000)) |> Enum.all?(&match?({:ok, _}, &1))
+
+      elapsed_ms = System.monotonic_time(:millisecond) - start
+      assert elapsed_ms < 850
+    end
+
+    test "callback returning error tuple throws a catchable JavaScript exception" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+      ctx = QuickjsEx.set!(ctx, :fail_softly, fn [] -> {:error, "host rejected"} end)
+
+      assert {:ok, "caught: host rejected"} =
+               QuickjsEx.eval(ctx, """
+               try {
+                 fail_softly();
+                 "not caught";
+               } catch (e) {
+                 "caught: " + e.message;
+               }
+               """)
+    end
+
+    test "callback reentrant eval returns typed error instead of deadlocking" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      ctx =
+        QuickjsEx.set!(ctx, :reenter, fn [] ->
+          QuickjsEx.eval(ctx, "1 + 1")
+        end)
+
+      assert {:error, {:callback_error, "reenter", message}} =
+               QuickjsEx.eval(ctx, "reenter()")
+
+      assert message =~ "context_busy"
+      assert {:ok, 42} = QuickjsEx.eval(ctx, "42")
+    end
   end
 
   describe "new behaviors" do
@@ -798,6 +963,38 @@ defmodule QuickjsExTest do
         end)
 
       assert {:error, :not_owner} = Task.await(task)
+    end
+
+    test "owner death interrupts active eval and stops retained context handles" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+          send(parent, {:ctx, ctx})
+          QuickjsEx.eval(ctx, "while (true) {}", timeout: 0)
+        end)
+
+      monitor_ref = Process.monitor(owner)
+      assert_receive {:ctx, ctx}, 1_000
+
+      Process.sleep(50)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :killed}, 1_000
+
+      result =
+        Enum.reduce_while(1..20, nil, fn _, _ ->
+          case QuickjsEx.eval(ctx, "1") do
+            {:error, :context_poisoned} = stopped ->
+              {:halt, stopped}
+
+            other ->
+              Process.sleep(50)
+              {:cont, other}
+          end
+        end)
+
+      assert {:error, :context_poisoned} = result
     end
 
     test "context_poisoned after OOM" do

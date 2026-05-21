@@ -90,8 +90,7 @@ defmodule QuickjsEx.NIF do
       quickjs_c: {@generated_quickjs_c_path, []},
       zig_quickjs_ng: {"../../priv/zig/zig_quickjs_ng/quickjs.zig", [:quickjs_c]}
     ],
-    # QuickJS-NG C sources (vendored at c_src/quickjs_ng/)
-    # Pulled in here so they are compiled but not used until T2.
+    # QuickJS-NG C sources vendored at c_src/quickjs_ng/.
     c: [
       src: [
         "../../c_src/quickjs_ng/quickjs.c",
@@ -105,15 +104,14 @@ defmodule QuickjsEx.NIF do
     resources: [:JsContextResource],
     nifs: [
       ping: [],
-      nif_new: [:dirty_cpu],
-      nif_eval: [:dirty_cpu],
+      nif_new: [],
+      nif_eval: [],
       nif_get_gas: [],
       nif_get: [],
       nif_set_value: [],
       nif_set_path: [],
       nif_gc: [],
-      nif_register_callback: [:dirty_cpu],
-      nif_set_callback_runner: [],
+      nif_register_callback: [],
       nif_signal_callback_result: [],
       nif_transfer_owner: []
     ]

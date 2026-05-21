@@ -4,7 +4,15 @@ QuickjsEx embeds the QuickJS-NG engine in Elixir through Zig NIFs, without Node.
 
 ## What it is
 
-QuickjsEx embeds the QuickJS-NG JavaScript engine directly inside the BEAM, targeting modern ES2023 without a Node.js dependency. It is implemented with Zig/Zigler NIFs and executes callbacks directly (no trampoline replay layer).
+QuickjsEx embeds the QuickJS-NG JavaScript engine directly inside the BEAM, targeting modern ES2023 without a Node.js dependency. It is implemented with Zig/Zigler NIFs and executes callbacks directly in the calling process.
+
+## Execution model
+
+Each context owns one dedicated OS thread for its `JSRuntime` and `JSContext`. Runtime-touching operations are enqueued to that thread and public Elixir APIs wait for a ref-tagged result message.
+
+Callbacks requested from JavaScript are delivered to the same caller receive loop, so blocking host callbacks do not occupy BEAM dirty scheduler threads. Evaluation timeout and gas accounting measure JavaScript execution time, not time parked on a host callback.
+
+Contexts are owned by the process that created them. Calls from other processes return `:not_owner`; attempts to re-enter the same context while it is already running return `:context_busy`; owner death stops the context thread and poisons retained handles.
 
 ## Installation
 
@@ -92,6 +100,7 @@ Operations that return `{:error, reason}` normalize engine failures into typed c
 - `:oom` - the JavaScript runtime ran out of memory; the context is non-recoverable.
 - `:context_poisoned` - the context is already poisoned by a prior non-recoverable failure.
 - `:not_owner` - the calling process does not own the context.
+- `:context_busy` - the context is already running a command, including reentrant use from a callback.
 - `:sandbox_violation` - sandbox policy blocked a restricted operation.
 - `:async_not_supported` - Promise/async evaluation is intentionally unsupported.
 - `:internal_error` - internal runtime/NIF failure; the context is non-recoverable.

@@ -11,16 +11,61 @@ const c = zig_quickjs_ng.c;
 
 const MAX_MARSHAL_DEPTH: u32 = 100;
 const INTERRUPT_GAS_QUANTUM: u64 = 10_000;
+const CALLBACK_OWNER_CHECK_NS: u64 = 100 * std.time.ns_per_ms;
+
+const CommandKind = enum {
+    eval,
+    get,
+    get_gas,
+    set_value,
+    set_path,
+    gc,
+    register_callback,
+    stop,
+};
+
+const Command = struct {
+    kind: CommandKind,
+    ctx_res_ptr: usize = 0,
+    caller_pid: beam.pid,
+    ref_env: beam.env,
+    ref_term: beam.term,
+    term_env: beam.env = null,
+    value_term: beam.term = .{ .v = undefined },
+    code: ?[]u8 = null,
+    timeout_ms: u64 = 0,
+    name: ?[:0]u8 = null,
+    path: ?[][:0]u8 = null,
+    next: ?*Command = null,
+};
 
 pub const JsContext = struct {
     runtime_ptr: usize,
     context_ptr: usize,
     owner_pid: beam.pid,
+    memory_limit_bytes: u64,
+    stack_limit_bytes: u64,
+    thread: e.ErlNifTid,
+    thread_started: bool,
+    thread_joined: bool,
+    init_mutex: std.Thread.Mutex,
+    init_condvar: std.Thread.Condition,
+    init_done: bool,
+    init_ok: bool,
+    queue_mutex: std.Thread.Mutex,
+    queue_condvar: std.Thread.Condition,
+    queue_head_ptr: usize,
+    queue_tail_ptr: usize,
+    shutting_down: bool,
+    busy: bool,
     deadline_ms: u64,
     poisoned: bool,
     was_interrupted: bool,
-    callback_runner_pid: beam.pid,
-    has_runner: bool,
+    active_caller_pid: beam.pid,
+    active_ref_env: beam.env,
+    active_ref_term: beam.term,
+    has_active_command: bool,
+    owner_check_ms: i64,
     callback_mutex: std.Thread.Mutex,
     callback_condvar: std.Thread.Condition,
     callback_req_id: u64,
@@ -29,8 +74,6 @@ pub const JsContext = struct {
     callback_result_ready: bool,
     callback_error_env: beam.env,
     callback_error: ?beam.term,
-    self_resource_env: beam.env,
-    self_resource_term: e.ErlNifTerm,
     gas_quanta_total: u64,
     gas_quanta_last: u64,
 };
@@ -41,6 +84,39 @@ fn runtime_ptr(ctx_res: *JsContext) *Runtime {
 
 fn context_ptr(ctx_res: *JsContext) *Context {
     return @ptrFromInt(ctx_res.context_ptr);
+}
+
+fn command_ptr(raw: usize) ?*Command {
+    if (raw == 0) return null;
+    return @ptrFromInt(raw);
+}
+
+fn command_context_ptr(cmd: *Command) ?*JsContext {
+    if (cmd.ctx_res_ptr == 0) return null;
+    return @ptrFromInt(cmd.ctx_res_ptr);
+}
+
+fn command_raw(cmd: ?*Command) usize {
+    return if (cmd) |value| @intFromPtr(value) else 0;
+}
+
+fn process_is_alive(pid: beam.pid) bool {
+    const check_env = e.enif_alloc_env() orelse return true;
+    defer e.enif_free_env(check_env);
+
+    var local_pid = pid;
+    return e.enif_is_process_alive(check_env, &local_pid) != 0;
+}
+
+fn request_context_shutdown(ctx_res: *JsContext) void {
+    ctx_res.queue_mutex.lock();
+    ctx_res.shutting_down = true;
+    ctx_res.queue_condvar.signal();
+    ctx_res.queue_mutex.unlock();
+
+    ctx_res.callback_mutex.lock();
+    ctx_res.callback_condvar.signal();
+    ctx_res.callback_mutex.unlock();
 }
 
 const CallbackEntry = struct {
@@ -62,25 +138,6 @@ fn throw_type_error(ctx: *Context, msg: []const u8) Value {
     return ctx.throwTypeError(msg_z);
 }
 
-fn callback_wait_timeout_ns(deadline_ms: u64) ?u64 {
-    if (deadline_ms == 0) return null;
-    if (deadline_ms > @as(u64, @intCast(std.math.maxInt(i64)))) return null;
-
-    const now = std.time.milliTimestamp();
-    if (now <= 0) return 0;
-
-    const deadline: i64 = @intCast(deadline_ms);
-    if (now >= deadline) return 0;
-
-    const remaining_ms_i64 = deadline - now;
-    const remaining_ms: u64 = @intCast(remaining_ms_i64);
-    if (remaining_ms > std.math.maxInt(u64) / std.time.ns_per_ms) {
-        return std.math.maxInt(u64);
-    }
-
-    return remaining_ms * std.time.ns_per_ms;
-}
-
 fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValue, _magic: c_int, entry: ?*CallbackEntry) Value {
     _ = _this;
     _ = _magic;
@@ -88,14 +145,31 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     const ctx = raw_ctx orelse return Value.exception;
     const callback_entry = entry orelse return ctx.throwTypeError("callback dispatch missing entry");
     const ctx_res = callback_entry.ctx_res;
-    const env = beam.context.env;
 
     if (ctx_res.poisoned) {
         return ctx.throwTypeError("javascript context poisoned");
     }
 
-    if (!ctx_res.has_runner) {
-        return ctx.throwTypeError("callback runner not configured");
+    if (!ctx_res.has_active_command) {
+        return ctx.throwTypeError("callback invoked without active command");
+    }
+
+    const msg_env = e.enif_alloc_env() orelse {
+        return ctx.throwTypeError("failed to allocate callback env");
+    };
+    defer e.enif_free_env(msg_env);
+
+    const wait_started = std.time.milliTimestamp();
+
+    const active_ref_copy = beam.term{
+        .v = e.enif_make_copy(msg_env, ctx_res.active_ref_term.v),
+    };
+
+    var caller_pid = ctx_res.active_caller_pid;
+
+    if (!process_is_alive(caller_pid)) {
+        request_context_shutdown(ctx_res);
+        return ctx.throwTypeError("callback caller unavailable");
     }
 
     var args = beam.allocator.alloc(beam.term, argv.len) catch {
@@ -105,12 +179,12 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
 
     for (argv, 0..) |arg_raw, index| {
         const arg_value: Value = @bitCast(arg_raw);
-        args[index] = js_to_erl(env, ctx, arg_value, 0) catch {
+        args[index] = js_to_erl(msg_env, ctx, arg_value, 0) catch {
             return ctx.throwTypeError("failed to convert callback argument");
         };
     }
 
-    const args_list = beam.make(args, .{ .env = env });
+    const args_list = beam.make(args, .{ .env = msg_env });
 
     ctx_res.callback_mutex.lock();
     ctx_res.callback_req_id += 1;
@@ -123,36 +197,36 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     ctx_res.callback_result = .{ .v = undefined };
     ctx_res.callback_mutex.unlock();
 
-    const ctx_ref = beam.term{
-        .v = e.enif_make_copy(env, ctx_res.self_resource_term),
-    };
-
     const message = beam.make(.{
-        .callback_request,
+        .quickjs_ex_callback,
+        active_ref_copy,
         req_id,
         callback_entry.name[0..callback_entry.name.len],
         args_list,
-        ctx_ref,
-    }, .{ .env = env });
+    }, .{ .env = msg_env });
 
-    var runner_pid = ctx_res.callback_runner_pid;
-    if (e.enif_send(env, &runner_pid, null, message.v) == 0) {
+    if (e.enif_send(null, &caller_pid, msg_env, message.v) == 0) {
         ctx_res.poisoned = true;
-        return ctx.throwTypeError("callback runner unavailable");
+        return ctx.throwTypeError("callback caller unavailable");
     }
 
     ctx_res.callback_mutex.lock();
     while (!ctx_res.callback_result_ready) {
-        if (callback_wait_timeout_ns(ctx_res.deadline_ms)) |timeout_ns| {
-            ctx_res.callback_condvar.timedWait(&ctx_res.callback_mutex, timeout_ns) catch {
-                ctx_res.was_interrupted = true;
+        ctx_res.callback_condvar.timedWait(&ctx_res.callback_mutex, CALLBACK_OWNER_CHECK_NS) catch {
+            if (!process_is_alive(caller_pid)) {
+                ctx_res.queue_mutex.lock();
+                ctx_res.shutting_down = true;
+                ctx_res.queue_condvar.signal();
+                ctx_res.queue_mutex.unlock();
                 ctx_res.callback_mutex.unlock();
-                return ctx.throwTypeError("callback timed out");
-            };
-            continue;
-        }
+                return ctx.throwTypeError("callback caller unavailable");
+            }
 
-        ctx_res.callback_condvar.wait(&ctx_res.callback_mutex);
+            if (ctx_res.shutting_down) {
+                ctx_res.callback_mutex.unlock();
+                return ctx.throwTypeError("javascript context stopped");
+            }
+        };
     }
 
     const callback_result = ctx_res.callback_result;
@@ -162,44 +236,55 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     ctx_res.callback_result_ready = false;
     ctx_res.callback_mutex.unlock();
 
+    const wait_finished = std.time.milliTimestamp();
+    if (ctx_res.deadline_ms > 0 and wait_started > 0 and wait_finished > wait_started) {
+        const waited_ms: u64 = @intCast(wait_finished - wait_started);
+        ctx_res.deadline_ms +|= waited_ms;
+    }
+
     const result_env = callback_result_env orelse {
         return ctx.throwTypeError("callback result env missing");
     };
     defer e.enif_free_env(result_env);
 
+    const parse_env = e.enif_alloc_env() orelse {
+        return ctx.throwTypeError("failed to allocate callback parse env");
+    };
+    defer e.enif_free_env(parse_env);
+
     const local_result = beam.term{
-        .v = e.enif_make_copy(env, callback_result.v),
+        .v = e.enif_make_copy(parse_env, callback_result.v),
     };
 
     var response_arity: c_int = 0;
     var response_items: [*c]const e.ErlNifTerm = undefined;
-    if (e.enif_get_tuple(env, local_result.v, &response_arity, @ptrCast(&response_items)) == 0 or response_arity != 2) {
+    if (e.enif_get_tuple(parse_env, local_result.v, &response_arity, @ptrCast(&response_items)) == 0 or response_arity != 2) {
         return ctx.throwTypeError("invalid callback response");
     }
 
     const status_term = beam.term{ .v = response_items[0] };
     const payload_term = beam.term{ .v = response_items[1] };
 
-    if (term_is_atom(env, status_term, "ok")) {
-        return erl_to_js(env, ctx, payload_term, 0) catch {
+    if (term_is_atom(parse_env, status_term, "ok")) {
+        return erl_to_js(parse_env, ctx, payload_term, 0) catch {
             return ctx.throwTypeError("failed to encode callback result");
         };
     }
 
-    if (term_is_atom(env, status_term, "error")) {
+    if (term_is_atom(parse_env, status_term, "error")) {
         var error_arity: c_int = 0;
         var error_items: [*c]const e.ErlNifTerm = undefined;
-        if (e.enif_get_tuple(env, payload_term.v, &error_arity, @ptrCast(&error_items)) == 0 or error_arity != 3) {
+        if (e.enif_get_tuple(parse_env, payload_term.v, &error_arity, @ptrCast(&error_items)) == 0 or error_arity != 3) {
             return ctx.throwTypeError("invalid callback error");
         }
 
         const error_tag = beam.term{ .v = error_items[0] };
-        if (!term_is_atom(env, error_tag, "cb")) {
+        if (!term_is_atom(parse_env, error_tag, "cb")) {
             return ctx.throwTypeError("invalid callback error tag");
         }
 
         const message_term = beam.term{ .v = error_items[2] };
-        const callback_message = beam.get([]const u8, message_term, .{ .env = env }) catch "callback failed";
+        const callback_message = beam.get([]const u8, message_term, .{ .env = parse_env }) catch "callback failed";
 
         if (ctx_res.callback_error_env) |old_env| {
             e.enif_free_env(old_env);
@@ -223,6 +308,8 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
 
 const JsContextCallbacks = struct {
     pub fn dtor(ctx_res: *JsContext) void {
+        shutdown_context_thread(ctx_res);
+
         if (ctx_res.callback_result_env) |result_env| {
             e.enif_free_env(result_env);
             ctx_res.callback_result_env = null;
@@ -233,14 +320,6 @@ const JsContextCallbacks = struct {
             ctx_res.callback_error_env = null;
             ctx_res.callback_error = null;
         }
-
-        if (ctx_res.self_resource_env) |resource_env| {
-            e.enif_free_env(resource_env);
-            ctx_res.self_resource_env = null;
-        }
-
-        context_ptr(ctx_res).deinit();
-        runtime_ptr(ctx_res).deinit();
     }
 };
 
@@ -248,116 +327,227 @@ pub const JsContextResource = beam.Resource(JsContext, @import("root"), .{
     .Callbacks = JsContextCallbacks,
 });
 
-fn interrupt_handler(opaque_ptr: ?*JsContext, runtime: *Runtime) bool {
-    _ = runtime;
-
-    const ctx_res = opaque_ptr orelse return false;
-    ctx_res.gas_quanta_total +|= 1;
-    if (ctx_res.deadline_ms == 0) return false;
-    if (ctx_res.deadline_ms > @as(u64, @intCast(std.math.maxInt(i64)))) return false;
-
-    const now = std.time.milliTimestamp();
-    if (now <= 0) return false;
-
-    if (now > @as(i64, @intCast(ctx_res.deadline_ms))) {
-        ctx_res.was_interrupted = true;
-        return true;
-    }
-
-    return false;
+fn set_thread_beam_env(env: beam.env) void {
+    beam.context = .{
+        .mode = .threaded,
+        .env = env,
+        .allocator = beam.allocator,
+    };
 }
 
-pub fn ping() beam.term {
-    return beam.make(.ok, .{});
+fn signal_init(ctx_res: *JsContext, ok: bool) void {
+    ctx_res.init_mutex.lock();
+    ctx_res.init_done = true;
+    ctx_res.init_ok = ok;
+    ctx_res.init_condvar.signal();
+    ctx_res.init_mutex.unlock();
 }
 
-pub fn nif_new(memory_limit_bytes: u64, stack_limit_bytes: u64, timeout_ms: u64) beam.term {
-    _ = timeout_ms;
+fn context_thread_main(raw_ctx: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const ctx_res: *JsContext = @ptrCast(@alignCast(raw_ctx.?));
+    set_thread_beam_env(null);
 
     const runtime = Runtime.init() catch {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        signal_init(ctx_res, false);
+        return null;
     };
-    errdefer runtime.deinit();
+    ctx_res.runtime_ptr = @intFromPtr(runtime);
 
-    if (memory_limit_bytes > 0) {
-        runtime.setMemoryLimit(memory_limit_bytes);
+    if (ctx_res.memory_limit_bytes > 0) {
+        runtime.setMemoryLimit(ctx_res.memory_limit_bytes);
     }
 
-    if (stack_limit_bytes > 0) {
-        runtime.setMaxStackSize(stack_limit_bytes);
+    if (ctx_res.stack_limit_bytes > 0) {
+        runtime.setMaxStackSize(ctx_res.stack_limit_bytes);
     }
+
+    runtime.updateStackTop();
 
     const context = Context.init(runtime) catch {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        runtime.deinit();
+        ctx_res.runtime_ptr = 0;
+        signal_init(ctx_res, false);
+        return null;
     };
-    errdefer context.deinit();
+    ctx_res.context_ptr = @intFromPtr(context);
 
-    const owner_pid = beam.self(.{}) catch {
-        return beam.make(.{ .@"error", .internal_error }, .{});
-    };
+    runtime.setInterruptHandler(JsContext, ctx_res, interrupt_handler);
+    context.setOpaque(JsContext, ctx_res);
 
-    var resource = JsContextResource.create(.{
-        .runtime_ptr = @intFromPtr(runtime),
-        .context_ptr = @intFromPtr(context),
-        .owner_pid = owner_pid,
-        .deadline_ms = 0,
-        .poisoned = false,
-        .was_interrupted = false,
-        .callback_runner_pid = std.mem.zeroes(beam.pid),
-        .has_runner = false,
-        .callback_mutex = .{},
-        .callback_condvar = .{},
-        .callback_req_id = 0,
-        .callback_result_env = null,
-        .callback_result = .{ .v = undefined },
-        .callback_result_ready = false,
-        .callback_error_env = null,
-        .callback_error = null,
-        .self_resource_env = null,
-        .self_resource_term = undefined,
-        .gas_quanta_total = 0,
-        .gas_quanta_last = 0,
-    }, .{}) catch {
-        return beam.make(.{ .@"error", .internal_error }, .{});
-    };
+    signal_init(ctx_res, true);
 
-    runtime.setInterruptHandler(JsContext, resource.__payload, interrupt_handler);
-    context.setOpaque(JsContext, resource.__payload);
+    while (dequeue_command(ctx_res)) |cmd| {
+        if (cmd.kind == .stop) {
+            destroy_command(cmd);
+            break;
+        }
 
-    const self_resource_env = e.enif_alloc_env();
-    if (self_resource_env == null) {
-        resource.release();
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        execute_command(ctx_res, cmd);
+        destroy_command(cmd);
+
+        ctx_res.queue_mutex.lock();
+        const should_stop = ctx_res.shutting_down;
+        ctx_res.queue_mutex.unlock();
+
+        if (should_stop) break;
     }
 
-    const self_resource_term = e.enif_make_resource(beam.context.env, @ptrCast(resource.__payload));
-    resource.__payload.self_resource_env = self_resource_env;
-    resource.__payload.self_resource_term = e.enif_make_copy(self_resource_env, self_resource_term);
+    drain_command_queue(ctx_res);
 
-    return beam.make(.{ .ok, resource }, .{});
+    if (ctx_res.context_ptr != 0) {
+        context_ptr(ctx_res).deinit();
+        ctx_res.context_ptr = 0;
+    }
+
+    if (ctx_res.runtime_ptr != 0) {
+        runtime_ptr(ctx_res).deinit();
+        ctx_res.runtime_ptr = 0;
+    }
+
+    return null;
 }
 
-pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) beam.term {
-    const env = beam.context.env;
+fn dequeue_command(ctx_res: *JsContext) ?*Command {
+    ctx_res.queue_mutex.lock();
+    defer ctx_res.queue_mutex.unlock();
 
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+    while (ctx_res.queue_head_ptr == 0 and !ctx_res.shutting_down) {
+        ctx_res.queue_condvar.timedWait(&ctx_res.queue_mutex, CALLBACK_OWNER_CHECK_NS) catch {
+            ctx_res.queue_mutex.unlock();
+            const owner_alive = process_is_alive(ctx_res.owner_pid);
+            ctx_res.queue_mutex.lock();
+
+            if (!owner_alive) {
+                ctx_res.shutting_down = true;
+                ctx_res.queue_condvar.signal();
+            }
+        };
+    }
+
+    const cmd = command_ptr(ctx_res.queue_head_ptr) orelse return null;
+    ctx_res.queue_head_ptr = command_raw(cmd.next);
+    if (ctx_res.queue_head_ptr == 0) {
+        ctx_res.queue_tail_ptr = 0;
+    }
+    cmd.next = null;
+    return cmd;
+}
+
+fn drain_command_queue(ctx_res: *JsContext) void {
+    ctx_res.queue_mutex.lock();
+    var cmd = command_ptr(ctx_res.queue_head_ptr);
+    ctx_res.queue_head_ptr = 0;
+    ctx_res.queue_tail_ptr = 0;
+    ctx_res.queue_mutex.unlock();
+
+    while (cmd) |current| {
+        const next = current.next;
+        send_command_error(current, .poisoned);
+        destroy_command(current);
+        cmd = next;
+    }
+}
+
+fn shutdown_context_thread(ctx_res: *JsContext) void {
+    ctx_res.queue_mutex.lock();
+    const should_join = ctx_res.thread_started and !ctx_res.thread_joined;
+    ctx_res.shutting_down = true;
+    ctx_res.queue_condvar.signal();
+    ctx_res.queue_mutex.unlock();
+
+    ctx_res.callback_mutex.lock();
+    ctx_res.callback_condvar.signal();
+    ctx_res.callback_mutex.unlock();
+
+    if (should_join) {
+        var result: ?*anyopaque = null;
+        _ = e.enif_thread_join(ctx_res.thread, &result);
+        ctx_res.thread_joined = true;
+    }
+}
+
+fn destroy_command(cmd: *Command) void {
+    if (cmd.code) |code| {
+        beam.allocator.free(code);
+    }
+
+    if (cmd.name) |name| {
+        beam.allocator.free(name);
+    }
+
+    if (cmd.path) |path| {
+        for (path) |segment| {
+            beam.allocator.free(segment);
+        }
+        beam.allocator.free(path);
+    }
+
+    if (cmd.term_env) |term_env| {
+        e.enif_free_env(term_env);
+    }
+
+    if (cmd.ref_env) |ref_env| {
+        e.enif_free_env(ref_env);
+    }
+
+    beam.allocator.destroy(cmd);
+}
+
+fn mark_command_complete(cmd: *Command) void {
+    const ctx_res = command_context_ptr(cmd) orelse return;
+
+    ctx_res.has_active_command = false;
+    ctx_res.active_ref_env = null;
+    ctx_res.active_ref_term = .{ .v = undefined };
+
+    ctx_res.queue_mutex.lock();
+    ctx_res.busy = false;
+    ctx_res.queue_mutex.unlock();
+}
+
+fn send_reply(cmd: *Command, reply_env: beam.env, response: beam.term) void {
+    const ref_copy = beam.term{
+        .v = e.enif_make_copy(reply_env, cmd.ref_term.v),
     };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
 
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
+    const message = beam.make(.{
+        .quickjs_ex_result,
+        ref_copy,
+        response,
+    }, .{ .env = reply_env });
+
+    var caller_pid = cmd.caller_pid;
+    mark_command_complete(cmd);
+    _ = e.enif_send(null, &caller_pid, reply_env, message.v);
+    e.enif_free_env(reply_env);
+}
+
+fn send_command_error(cmd: *Command, err: anytype) void {
+    const reply_env = e.enif_alloc_env() orelse return;
+    set_thread_beam_env(reply_env);
+    send_reply(cmd, reply_env, beam.make(.{ .@"error", err }, .{ .env = reply_env }));
+}
+
+fn execute_command(ctx_res: *JsContext, cmd: *Command) void {
+    switch (cmd.kind) {
+        .eval => execute_eval(ctx_res, cmd),
+        .get => execute_get(ctx_res, cmd),
+        .get_gas => execute_get_gas(ctx_res, cmd),
+        .set_value => execute_set_value(ctx_res, cmd),
+        .set_path => execute_set_path(ctx_res, cmd),
+        .gc => execute_gc(ctx_res, cmd),
+        .register_callback => execute_register_callback(ctx_res, cmd),
+        .stop => {},
     }
+}
 
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
+fn prepare_reply_env() ?beam.env {
+    const reply_env = e.enif_alloc_env() orelse return null;
+    set_thread_beam_env(reply_env);
+    return reply_env;
+}
 
-    const ctx = context_ptr(ctx_res);
-
-    ctx_res.was_interrupted = false;
-
+fn set_eval_deadline(ctx_res: *JsContext, timeout_ms: u64) void {
     if (timeout_ms > 0) {
         const now = std.time.milliTimestamp();
         if (now > 0) {
@@ -376,22 +566,29 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
     } else {
         ctx_res.deadline_ms = 0;
     }
+}
 
+fn execute_eval(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
+    const ctx = context_ptr(ctx_res);
+    const code = cmd.code orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
+    };
+
+    ctx_res.was_interrupted = false;
+    set_eval_deadline(ctx_res, cmd.timeout_ms);
     defer ctx_res.deadline_ms = 0;
 
-    var code_binary: e.ErlNifBinary = undefined;
-    if (e.enif_inspect_binary(env, code_term.v, &code_binary) == 0) {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+    ctx_res.active_caller_pid = cmd.caller_pid;
+    ctx_res.active_ref_env = cmd.ref_env;
+    ctx_res.active_ref_term = cmd.ref_term;
+    ctx_res.has_active_command = true;
+    defer {
+        ctx_res.has_active_command = false;
+        ctx_res.active_ref_env = null;
+        ctx_res.active_ref_term = .{ .v = undefined };
     }
-
-    const code = code_binary.data[0..code_binary.size];
-    const code_copy = beam.allocator.alloc(u8, code.len + 1) catch {
-        return poison_internal_error(ctx_res);
-    };
-    defer beam.allocator.free(code_copy);
-
-    @memcpy(code_copy[0..code.len], code);
-    code_copy[code.len] = 0;
 
     const gas_start = ctx_res.gas_quanta_total;
     defer {
@@ -399,7 +596,8 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
         ctx_res.gas_quanta_last = if (gas_delta == 0) 1 else gas_delta;
     }
 
-    const result = ctx.eval(code_copy[0..code.len], "<eval>", .{});
+    const eval_code = code[0 .. code.len - 1];
+    const result = ctx.eval(eval_code, "<eval>", .{});
     defer result.deinit(ctx);
 
     if (result.isException()) {
@@ -407,12 +605,13 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
         defer exc.deinit(ctx);
 
         if (ctx_res.was_interrupted) {
-            return beam.make(.{ .@"error", .timeout }, .{});
+            send_reply(cmd, reply_env, beam.make(.{ .@"error", .timeout }, .{ .env = reply_env }));
+            return;
         }
 
         if (ctx_res.callback_error) |callback_error| {
             const copied_callback_error = beam.term{
-                .v = e.enif_make_copy(env, callback_error.v),
+                .v = e.enif_make_copy(reply_env, callback_error.v),
             };
 
             if (ctx_res.callback_error_env) |error_env| {
@@ -421,170 +620,133 @@ pub fn nif_eval(resource_ref: beam.term, code_term: beam.term, timeout_ms: u64) 
             }
             ctx_res.callback_error = null;
 
-            return copied_callback_error;
+            send_reply(cmd, reply_env, copied_callback_error);
+            return;
         }
 
         if (exception_is_oom(ctx, exc)) {
             ctx_res.poisoned = true;
-            return beam.make(.{ .@"error", .oom }, .{});
+            send_reply(cmd, reply_env, beam.make(.{ .@"error", .oom }, .{ .env = reply_env }));
+            return;
         }
 
-        return js_error_from_exception(ctx, exc);
+        send_reply(cmd, reply_env, js_error_from_exception(ctx, exc));
+        return;
     }
 
     if (result.isPromise()) {
-        return beam.make(.{ .@"error", .async }, .{});
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .async }, .{ .env = reply_env }));
+        return;
     }
 
     if (result.isFunction(ctx)) {
-        return beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{});
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{ .env = reply_env }));
+        return;
     }
 
-    const erl_term = js_to_erl(env, ctx, result, 0) catch |err| {
-        return switch (err) {
-            error.MaxDepth => beam.make(.{ .@"error", .{ .js, "maximum depth exceeded" } }, .{}),
-            error.FunctionNotSerializable => beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{}),
+    const erl_term = js_to_erl(reply_env, ctx, result, 0) catch |err| {
+        const response = switch (err) {
+            error.MaxDepth => beam.make(.{ .@"error", .{ .js, "maximum depth exceeded" } }, .{ .env = reply_env }),
+            error.FunctionNotSerializable => beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{ .env = reply_env }),
             error.JSError => current_js_error_with_poison(ctx_res, ctx),
             error.OutOfMemory => poison_internal_error(ctx_res),
         };
+        send_reply(cmd, reply_env, response);
+        return;
     };
 
-    return beam.make(.{ .ok, erl_term }, .{});
+    send_reply(cmd, reply_env, beam.make(.{ .ok, erl_term }, .{ .env = reply_env }));
 }
 
-pub fn nif_get_gas(resource_ref: beam.term) beam.term {
-    const env = beam.context.env;
-
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
-    };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
-
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
-    }
-
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
-
+fn execute_get_gas(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
     const gas = beam.make(.{
         .last = ctx_res.gas_quanta_last,
         .total = ctx_res.gas_quanta_total,
         .quantum = INTERRUPT_GAS_QUANTUM,
-    }, .{});
+    }, .{ .env = reply_env });
 
-    return beam.make(.{ .ok, gas }, .{});
+    send_reply(cmd, reply_env, beam.make(.{ .ok, gas }, .{ .env = reply_env }));
 }
 
-pub fn nif_get(resource_ref: beam.term, name: []const u8) beam.term {
-    const env = beam.context.env;
-
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+fn execute_get(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
+    const name = cmd.name orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
     };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
-
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
-    }
-
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
-
     const ctx = context_ptr(ctx_res);
 
     const global = ctx.getGlobalObject();
     defer global.deinit(ctx);
 
-    const name_z = alloc_z_string(name) catch {
-        return poison_internal_error(ctx_res);
-    };
-    defer beam.allocator.free(name_z);
-
-    const prop = global.getPropertyStr(ctx, name_z);
+    const prop = global.getPropertyStr(ctx, name);
     defer prop.deinit(ctx);
 
     if (prop.isException()) {
-        return current_js_error_with_poison(ctx_res, ctx);
+        send_reply(cmd, reply_env, current_js_error_with_poison(ctx_res, ctx));
+        return;
     }
 
-    const erl_term = js_to_erl(env, ctx, prop, 0) catch |err| {
-        return switch (err) {
-            error.MaxDepth => beam.make(.{ .@"error", .{ .js, "maximum depth exceeded" } }, .{}),
-            error.FunctionNotSerializable => beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{}),
+    const erl_term = js_to_erl(reply_env, ctx, prop, 0) catch |err| {
+        const response = switch (err) {
+            error.MaxDepth => beam.make(.{ .@"error", .{ .js, "maximum depth exceeded" } }, .{ .env = reply_env }),
+            error.FunctionNotSerializable => beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{ .env = reply_env }),
             error.JSError => current_js_error_with_poison(ctx_res, ctx),
             error.OutOfMemory => poison_internal_error(ctx_res),
         };
+        send_reply(cmd, reply_env, response);
+        return;
     };
 
-    return beam.make(.{ .ok, erl_term }, .{});
+    send_reply(cmd, reply_env, beam.make(.{ .ok, erl_term }, .{ .env = reply_env }));
 }
 
-pub fn nif_set_value(resource_ref: beam.term, name: []const u8, value: beam.term) beam.term {
-    const env = beam.context.env;
-
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+fn execute_set_value(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
+    const name = cmd.name orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
     };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
-
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
-    }
-
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
-
+    const value_env = cmd.term_env orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
+    };
     const ctx = context_ptr(ctx_res);
 
     const global = ctx.getGlobalObject();
     defer global.deinit(ctx);
 
-    const name_z = alloc_z_string(name) catch {
-        return poison_internal_error(ctx_res);
-    };
-    defer beam.allocator.free(name_z);
-
-    const js_val = erl_to_js(env, ctx, value, 0) catch |err| {
-        return erl_to_js_error_term(ctx_res, ctx, err);
+    const js_val = erl_to_js(value_env, ctx, cmd.value_term, 0) catch |err| {
+        send_reply(cmd, reply_env, erl_to_js_error_term(ctx_res, ctx, err));
+        return;
     };
 
-    global.setPropertyStr(ctx, name_z, js_val) catch {
-        return property_set_error_term(ctx_res, ctx);
+    global.setPropertyStr(ctx, name, js_val) catch {
+        send_reply(cmd, reply_env, property_set_error_term(ctx_res, ctx));
+        return;
     };
 
-    return beam.make(.ok, .{});
+    send_reply(cmd, reply_env, beam.make(.ok, .{ .env = reply_env }));
 }
 
-pub fn nif_set_path(resource_ref: beam.term, path: [][]const u8, value: beam.term) beam.term {
-    const env = beam.context.env;
-
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+fn execute_set_path(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
+    const path = cmd.path orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
     };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
-
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
-    }
-
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
+    const value_env = cmd.term_env orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
+    };
 
     if (path.len < 1) {
-        return beam.make(.{ .@"error", .{ .js, "path must not be empty" } }, .{});
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .{ .js, "path must not be empty" } }, .{ .env = reply_env }));
+        return;
     }
 
     const ctx = context_ptr(ctx_res);
-
     const global = ctx.getGlobalObject();
     defer global.deinit(ctx);
 
@@ -592,16 +754,12 @@ pub fn nif_set_path(resource_ref: beam.term, path: [][]const u8, value: beam.ter
     defer current.deinit(ctx);
 
     for (path[0 .. path.len - 1]) |segment| {
-        const segment_z = alloc_z_string(segment) catch {
-            return poison_internal_error(ctx_res);
-        };
-        defer beam.allocator.free(segment_z);
-
-        var child = current.getPropertyStr(ctx, segment_z);
+        var child = current.getPropertyStr(ctx, segment);
 
         if (child.isException()) {
             child.deinit(ctx);
-            return current_js_error_with_poison(ctx_res, ctx);
+            send_reply(cmd, reply_env, current_js_error_with_poison(ctx_res, ctx));
+            return;
         }
 
         if (child.isNull() or child.isUndefined()) {
@@ -609,21 +767,25 @@ pub fn nif_set_path(resource_ref: beam.term, path: [][]const u8, value: beam.ter
 
             const new_obj = Value.initObject(ctx);
             if (new_obj.isException()) {
-                return current_js_error_with_poison(ctx_res, ctx);
+                send_reply(cmd, reply_env, current_js_error_with_poison(ctx_res, ctx));
+                return;
             }
 
-            current.setPropertyStr(ctx, segment_z, new_obj) catch {
-                return property_set_error_term(ctx_res, ctx);
+            current.setPropertyStr(ctx, segment, new_obj) catch {
+                send_reply(cmd, reply_env, property_set_error_term(ctx_res, ctx));
+                return;
             };
 
-            child = current.getPropertyStr(ctx, segment_z);
+            child = current.getPropertyStr(ctx, segment);
             if (child.isException()) {
                 child.deinit(ctx);
-                return current_js_error_with_poison(ctx_res, ctx);
+                send_reply(cmd, reply_env, current_js_error_with_poison(ctx_res, ctx));
+                return;
             }
         } else if (!is_plain_object(ctx, child)) {
             child.deinit(ctx);
-            return beam.make(.{ .@"error", .{ .js, "cannot set nested path: intermediate is not an object" } }, .{});
+            send_reply(cmd, reply_env, beam.make(.{ .@"error", .{ .js, "cannot set nested path: intermediate is not an object" } }, .{ .env = reply_env }));
+            return;
         }
 
         const prev = current;
@@ -631,73 +793,45 @@ pub fn nif_set_path(resource_ref: beam.term, path: [][]const u8, value: beam.ter
         prev.deinit(ctx);
     }
 
-    const last_segment_z = alloc_z_string(path[path.len - 1]) catch {
-        return poison_internal_error(ctx_res);
-    };
-    defer beam.allocator.free(last_segment_z);
-
-    const js_val = erl_to_js(env, ctx, value, 0) catch |err| {
-        return erl_to_js_error_term(ctx_res, ctx, err);
+    const js_val = erl_to_js(value_env, ctx, cmd.value_term, 0) catch |err| {
+        send_reply(cmd, reply_env, erl_to_js_error_term(ctx_res, ctx, err));
+        return;
     };
 
-    current.setPropertyStr(ctx, last_segment_z, js_val) catch {
-        return property_set_error_term(ctx_res, ctx);
+    current.setPropertyStr(ctx, path[path.len - 1], js_val) catch {
+        send_reply(cmd, reply_env, property_set_error_term(ctx_res, ctx));
+        return;
     };
 
-    return beam.make(.ok, .{});
+    send_reply(cmd, reply_env, beam.make(.ok, .{ .env = reply_env }));
 }
 
-pub fn nif_gc(resource_ref: beam.term) beam.term {
-    const env = beam.context.env;
-
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
-    };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
-
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
-    }
-
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
-
+fn execute_gc(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
     runtime_ptr(ctx_res).runGC();
-    return beam.make(.ok, .{});
+    send_reply(cmd, reply_env, beam.make(.ok, .{ .env = reply_env }));
 }
 
-pub fn nif_register_callback(resource_ref: beam.term, name: []const u8, _fun_term: beam.term) beam.term {
-    _ = _fun_term;
-
-    const env = beam.context.env;
-
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
-    };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
-
-    if (ctx_res.poisoned) {
-        return beam.make(.{ .@"error", .poisoned }, .{});
-    }
-
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
-    }
-
-    const callback_name = alloc_z_string(name) catch {
-        return poison_internal_error(ctx_res);
+fn execute_register_callback(ctx_res: *JsContext, cmd: *Command) void {
+    const reply_env = prepare_reply_env() orelse return;
+    const callback_name = cmd.name orelse {
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
     };
 
     const callback_entry = beam.allocator.create(CallbackEntry) catch {
-        beam.allocator.free(callback_name);
-        return poison_internal_error(ctx_res);
+        send_reply(cmd, reply_env, poison_internal_error(ctx_res));
+        return;
+    };
+
+    const callback_name_copy = alloc_z_string(callback_name[0..callback_name.len]) catch {
+        beam.allocator.destroy(callback_entry);
+        send_reply(cmd, reply_env, poison_internal_error(ctx_res));
+        return;
     };
 
     callback_entry.* = .{
-        .name = callback_name,
+        .name = callback_name_copy,
         .ctx_res = ctx_res,
     };
 
@@ -715,7 +849,8 @@ pub fn nif_register_callback(resource_ref: beam.term, name: []const u8, _fun_ter
 
     if (fn_value.isException()) {
         callbackEntryFinalizer(callback_entry);
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
     }
 
     const global = ctx.getGlobalObject();
@@ -723,47 +858,395 @@ pub fn nif_register_callback(resource_ref: beam.term, name: []const u8, _fun_ter
 
     global.setPropertyStr(ctx, callback_entry.name, fn_value) catch {
         ctx_res.poisoned = true;
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
+        return;
     };
 
-    return beam.make(.ok, .{});
+    send_reply(cmd, reply_env, beam.make(.ok, .{ .env = reply_env }));
 }
 
-pub fn nif_set_callback_runner(resource_ref: beam.term, runner_pid: beam.pid) beam.term {
-    const env = beam.context.env;
+fn interrupt_handler(opaque_ptr: ?*JsContext, runtime: *Runtime) bool {
+    _ = runtime;
 
-    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
-    };
-    defer ctx_resource.release();
-    const ctx_res = ctx_resource.__payload;
+    const ctx_res = opaque_ptr orelse return false;
+    ctx_res.gas_quanta_total +|= 1;
+    if (ctx_res.shutting_down) return true;
 
-    if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
+    const now = std.time.milliTimestamp();
+    if (now > 0 and now - ctx_res.owner_check_ms >= @as(i64, @intCast(CALLBACK_OWNER_CHECK_NS / std.time.ns_per_ms))) {
+        ctx_res.owner_check_ms = now;
+        if (!process_is_alive(ctx_res.owner_pid)) {
+            request_context_shutdown(ctx_res);
+            return true;
+        }
     }
 
-    ctx_res.callback_runner_pid = runner_pid;
-    ctx_res.has_runner = true;
+    if (ctx_res.deadline_ms == 0) return false;
+    if (ctx_res.deadline_ms > @as(u64, @intCast(std.math.maxInt(i64)))) return false;
+    if (now <= 0) return false;
 
+    if (now > @as(i64, @intCast(ctx_res.deadline_ms))) {
+        ctx_res.was_interrupted = true;
+        return true;
+    }
+
+    return false;
+}
+
+pub fn ping() beam.term {
     return beam.make(.ok, .{});
 }
 
-pub fn nif_signal_callback_result(resource_ref: beam.term, req_id: u64, result: beam.term) beam.term {
+pub fn nif_new(memory_limit_bytes: u64, stack_limit_bytes: u64, timeout_ms: u64) beam.term {
+    _ = timeout_ms;
+
+    const owner_pid = beam.self(.{}) catch {
+        return beam.make(.{ .@"error", .internal_error }, .{});
+    };
+
+    var resource = JsContextResource.create(.{
+        .runtime_ptr = 0,
+        .context_ptr = 0,
+        .owner_pid = owner_pid,
+        .memory_limit_bytes = memory_limit_bytes,
+        .stack_limit_bytes = stack_limit_bytes,
+        .thread = undefined,
+        .thread_started = false,
+        .thread_joined = false,
+        .init_mutex = .{},
+        .init_condvar = .{},
+        .init_done = false,
+        .init_ok = false,
+        .queue_mutex = .{},
+        .queue_condvar = .{},
+        .queue_head_ptr = 0,
+        .queue_tail_ptr = 0,
+        .shutting_down = false,
+        .busy = false,
+        .deadline_ms = 0,
+        .poisoned = false,
+        .was_interrupted = false,
+        .active_caller_pid = std.mem.zeroes(beam.pid),
+        .active_ref_env = null,
+        .active_ref_term = .{ .v = undefined },
+        .has_active_command = false,
+        .owner_check_ms = 0,
+        .callback_mutex = .{},
+        .callback_condvar = .{},
+        .callback_req_id = 0,
+        .callback_result_env = null,
+        .callback_result = .{ .v = undefined },
+        .callback_result_ready = false,
+        .callback_error_env = null,
+        .callback_error = null,
+        .gas_quanta_total = 0,
+        .gas_quanta_last = 0,
+    }, .{}) catch {
+        return beam.make(.{ .@"error", .internal_error }, .{});
+    };
+
+    if (e.enif_thread_create(@constCast("quickjs_ex_ctx"), &resource.__payload.thread, context_thread_main, resource.__payload, null) != 0) {
+        resource.release();
+        return beam.make(.{ .@"error", .internal_error }, .{});
+    }
+
+    resource.__payload.thread_started = true;
+
+    resource.__payload.init_mutex.lock();
+    while (!resource.__payload.init_done) {
+        resource.__payload.init_condvar.wait(&resource.__payload.init_mutex);
+    }
+    const init_ok = resource.__payload.init_ok;
+    resource.__payload.init_mutex.unlock();
+
+    if (!init_ok) {
+        shutdown_context_thread(resource.__payload);
+        resource.release();
+        return beam.make(.{ .@"error", .internal_error }, .{});
+    }
+
+    return beam.make(.{ .ok, resource }, .{});
+}
+
+fn create_command(env: beam.env, kind: CommandKind, request_ref: beam.term) ?*Command {
+    const ref_env = e.enif_alloc_env() orelse return null;
+    errdefer e.enif_free_env(ref_env);
+
+    const caller_pid = beam.self(.{ .env = env }) catch return null;
+    const cmd = beam.allocator.create(Command) catch return null;
+    errdefer beam.allocator.destroy(cmd);
+
+    cmd.* = .{
+        .kind = kind,
+        .caller_pid = caller_pid,
+        .ref_env = ref_env,
+        .ref_term = .{ .v = e.enif_make_copy(ref_env, request_ref.v) },
+    };
+
+    return cmd;
+}
+
+fn enqueue_checked(env: beam.env, ctx_res: *JsContext, cmd: *Command) beam.term {
+    ctx_res.queue_mutex.lock();
+    defer ctx_res.queue_mutex.unlock();
+
+    if (ctx_res.poisoned) {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .poisoned }, .{ .env = env });
+    }
+
+    if (ctx_res.shutting_down) {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .poisoned }, .{ .env = env });
+    }
+
+    if (ctx_res.busy) {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .context_busy }, .{ .env = env });
+    }
+
+    cmd.ctx_res_ptr = @intFromPtr(ctx_res);
+    ctx_res.busy = true;
+
+    if (command_ptr(ctx_res.queue_tail_ptr)) |tail| {
+        tail.next = cmd;
+    } else {
+        ctx_res.queue_head_ptr = command_raw(cmd);
+    }
+
+    ctx_res.queue_tail_ptr = command_raw(cmd);
+    ctx_res.queue_condvar.signal();
+    return beam.make(.ok, .{ .env = env });
+}
+
+fn copy_binary_arg(env: beam.env, term: beam.term) ?[]u8 {
+    var binary: e.ErlNifBinary = undefined;
+    if (e.enif_inspect_binary(env, term.v, &binary) == 0) {
+        return null;
+    }
+
+    const source = binary.data[0..binary.size];
+    const copy = beam.allocator.alloc(u8, source.len + 1) catch return null;
+    @memcpy(copy[0..source.len], source);
+    copy[source.len] = 0;
+    return copy;
+}
+
+fn copy_value_term(value: beam.term) ?struct { env: beam.env, term: beam.term } {
+    const term_env = e.enif_alloc_env() orelse return null;
+    const copied = e.enif_make_copy(term_env, value.v);
+    return .{ .env = term_env, .term = .{ .v = copied } };
+}
+
+fn copy_path(path: [][]const u8) ?[][:0]u8 {
+    const copied_path = beam.allocator.alloc([:0]u8, path.len) catch return null;
+    errdefer beam.allocator.free(copied_path);
+
+    for (path, 0..) |segment, index| {
+        copied_path[index] = alloc_z_string(segment) catch {
+            for (copied_path[0..index]) |copied_segment| {
+                beam.allocator.free(copied_segment);
+            }
+            return null;
+        };
+    }
+
+    return copied_path;
+}
+
+fn command_context_or_error(env: beam.env, resource_ref: beam.term) union(enum) { ok: JsContextResource, err: beam.term } {
+    const ctx_resource = fetch_js_context(env, resource_ref) orelse {
+        return .{ .err = beam.make(.{ .@"error", .internal_error }, .{ .env = env }) };
+    };
+    const ctx_res = ctx_resource.__payload;
+
+    if (ctx_res.poisoned) {
+        ctx_resource.release();
+        return .{ .err = beam.make(.{ .@"error", .poisoned }, .{ .env = env }) };
+    }
+
+    if (ctx_res.shutting_down) {
+        ctx_resource.release();
+        return .{ .err = beam.make(.{ .@"error", .poisoned }, .{ .env = env }) };
+    }
+
+    if (!is_owner(env, ctx_res.owner_pid)) {
+        ctx_resource.release();
+        return .{ .err = beam.make(.{ .@"error", .not_owner }, .{ .env = env }) };
+    }
+
+    return .{ .ok = ctx_resource };
+}
+
+pub fn nif_eval(resource_ref: beam.term, request_ref: beam.term, code_term: beam.term, timeout_ms: u64) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .eval, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{});
+    };
+
+    cmd.code = copy_binary_arg(env, code_term) orelse {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.timeout_ms = timeout_ms;
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_get_gas(resource_ref: beam.term, request_ref: beam.term) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .get_gas, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_get(resource_ref: beam.term, request_ref: beam.term, name: []const u8) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .get, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.name = alloc_z_string(name) catch {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_set_value(resource_ref: beam.term, request_ref: beam.term, name: []const u8, value: beam.term) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .set_value, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.name = alloc_z_string(name) catch {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    const copied_value = copy_value_term(value) orelse {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.term_env = copied_value.env;
+    cmd.value_term = copied_value.term;
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_set_path(resource_ref: beam.term, request_ref: beam.term, path: [][]const u8, value: beam.term) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .set_path, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.path = copy_path(path) orelse {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    const copied_value = copy_value_term(value) orelse {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.term_env = copied_value.env;
+    cmd.value_term = copied_value.term;
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_gc(resource_ref: beam.term, request_ref: beam.term) beam.term {
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .gc, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_register_callback(resource_ref: beam.term, request_ref: beam.term, name: []const u8, _fun_term: beam.term) beam.term {
+    _ = _fun_term;
+
+    const env = beam.context.env;
+
+    const ctx_resource = switch (command_context_or_error(env, resource_ref)) {
+        .ok => |resource| resource,
+        .err => |err| return err,
+    };
+    defer ctx_resource.release();
+
+    const cmd = create_command(env, .register_callback, request_ref) orelse {
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+    cmd.name = alloc_z_string(name) catch {
+        destroy_command(cmd);
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
+    };
+
+    return enqueue_checked(env, ctx_resource.__payload, cmd);
+}
+
+pub fn nif_signal_callback_result(resource_ref: beam.term, request_ref: beam.term, req_id: u64, result: beam.term) beam.term {
     const env = beam.context.env;
 
     const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
     };
     defer ctx_resource.release();
     const ctx_res = ctx_resource.__payload;
 
-    if (!ctx_res.has_runner or !is_owner(env, ctx_res.callback_runner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
+    if (!ctx_res.has_active_command or !is_owner(env, ctx_res.owner_pid)) {
+        return beam.make(.{ .@"error", .not_owner }, .{ .env = env });
+    }
+
+    const active_ref = e.enif_make_copy(env, ctx_res.active_ref_term.v);
+    if (e.enif_compare(request_ref.v, active_ref) != 0) {
+        return beam.make(.{ .@"error", .stale }, .{ .env = env });
     }
 
     const msg_env = e.enif_alloc_env();
     if (msg_env == null) {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
     }
 
     const copied_result = e.enif_make_copy(msg_env, result.v);
@@ -773,7 +1256,7 @@ pub fn nif_signal_callback_result(resource_ref: beam.term, req_id: u64, result: 
 
     if (ctx_res.callback_req_id != req_id) {
         e.enif_free_env(msg_env);
-        return beam.make(.{ .@"error", .stale }, .{});
+        return beam.make(.{ .@"error", .stale }, .{ .env = env });
     }
 
     if (ctx_res.callback_result_env) |previous_env| {
@@ -785,24 +1268,24 @@ pub fn nif_signal_callback_result(resource_ref: beam.term, req_id: u64, result: 
     ctx_res.callback_result_ready = true;
     ctx_res.callback_condvar.signal();
 
-    return beam.make(.ok, .{});
+    return beam.make(.ok, .{ .env = env });
 }
 
 pub fn nif_transfer_owner(resource_ref: beam.term, new_owner: beam.pid) beam.term {
     const env = beam.context.env;
 
     const ctx_resource = fetch_js_context(env, resource_ref) orelse {
-        return beam.make(.{ .@"error", .internal_error }, .{});
+        return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
     };
     defer ctx_resource.release();
     const ctx_res = ctx_resource.__payload;
 
     if (!is_owner(env, ctx_res.owner_pid)) {
-        return beam.make(.{ .@"error", .not_owner }, .{});
+        return beam.make(.{ .@"error", .not_owner }, .{ .env = env });
     }
 
     ctx_res.owner_pid = new_owner;
-    return beam.make(.ok, .{});
+    return beam.make(.ok, .{ .env = env });
 }
 
 fn fetch_js_context(env: beam.env, resource_ref: beam.term) ?JsContextResource {
@@ -820,14 +1303,6 @@ fn is_owner(env: beam.env, owner_pid: beam.pid) bool {
     const self_term = beam.make(self_pid, .{ .env = env });
 
     return e.enif_is_identical(owner_term.v, self_term.v) != 0;
-}
-
-fn is_owner_or_runner(env: beam.env, ctx_res: *JsContext) bool {
-    if (is_owner(env, ctx_res.owner_pid)) {
-        return true;
-    }
-
-    return ctx_res.has_runner and is_owner(env, ctx_res.callback_runner_pid);
 }
 
 fn is_plain_object(ctx: *Context, val: Value) bool {
