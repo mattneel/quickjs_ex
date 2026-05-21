@@ -739,7 +739,15 @@ fn module_loader_fn(raw_ctx_res: ?*JsContext, ctx: *Context, module_name: [:0]co
         return null;
     };
 
-    const module_value = ctx.eval(source, module_name, .{ .type = .module, .compile_only = true });
+    // Match top-level eval: keep a sentinel byte after the source for parser paths.
+    const source_z = alloc_z_string(source) catch {
+        ctx_res.module_load_error = true;
+        _ = ctx.throwOutOfMemory();
+        return null;
+    };
+    defer beam.allocator.free(source_z);
+
+    const module_value = ctx.eval(source_z, module_name, .{ .type = .module, .compile_only = true });
     if (module_value.isException()) {
         ctx_res.module_load_error = true;
         return null;
