@@ -1554,7 +1554,7 @@ fn erl_to_js(env: beam.env, ctx: *Context, term: beam.term, depth: u32) error{ M
     switch (term_type) {
         .atom => {
             if (term_is_atom(env, term, "nil")) {
-                return Value.null_;
+                return Value.@"null";
             }
 
             if (term_is_atom(env, term, "true")) {

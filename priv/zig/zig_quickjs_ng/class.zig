@@ -1,4 +1,4 @@
-// VENDORED: copied from mitchellh/zig-quickjs-ng commit b3731c9.
+// VENDORED: copied from mitchellh/zig-quickjs-ng commit eb1d44ce43fd64f8403c1a94fad242ebae04d1fb.
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
@@ -156,7 +156,7 @@ test "Runtime.newClass registers a class" {
 
     try testing.expect(!rt.isRegisteredClass(class_id));
 
-    const def = Def{ .class_name = "TestClass" };
+    const def: Def = .{ .class_name = "TestClass" };
     try rt.newClass(class_id, &def);
 
     try testing.expect(rt.isRegisteredClass(class_id));
@@ -173,7 +173,7 @@ test "Runtime.getClassName returns class name" {
 
     try testing.expect(!rt.isRegisteredClass(class_id));
 
-    const def = Def{ .class_name = "MyCustomClass" };
+    const def: Def = .{ .class_name = "MyCustomClass" };
     try rt.newClass(class_id, &def);
 
     try testing.expect(rt.isRegisteredClass(class_id));
@@ -193,7 +193,7 @@ test "Value.initObjectClass creates class instance" {
 
     const class_id: Id = .new(rt);
 
-    const def = Def{ .class_name = "InstanceTest" };
+    const def: Def = .{ .class_name = "InstanceTest" };
     try rt.newClass(class_id, &def);
 
     const proto = Value.initObject(ctx);
@@ -216,7 +216,7 @@ test "Value opaque data round-trip" {
 
     const class_id: Id = .new(rt);
 
-    const def = Def{ .class_name = "OpaqueTest" };
+    const def: Def = .{ .class_name = "OpaqueTest" };
     try rt.newClass(class_id, &def);
 
     const proto = Value.initObject(ctx);
@@ -227,7 +227,7 @@ test "Value opaque data round-trip" {
     defer obj.deinit(ctx);
 
     const TestData = struct { value: i32 };
-    var data = TestData{ .value = 42 };
+    var data: TestData = .{ .value = 42 };
 
     try testing.expect(obj.setOpaque(&data));
 
@@ -249,7 +249,7 @@ test "Value.getAnyOpaque retrieves opaque with class ID" {
 
     const class_id: Id = .new(rt);
 
-    const def = Def{ .class_name = "AnyOpaqueTest" };
+    const def: Def = .{ .class_name = "AnyOpaqueTest" };
     try rt.newClass(class_id, &def);
 
     const proto = Value.initObject(ctx);
@@ -260,7 +260,7 @@ test "Value.getAnyOpaque retrieves opaque with class ID" {
     defer obj.deinit(ctx);
 
     const TestData = struct { value: i32 };
-    var data = TestData{ .value = 99 };
+    var data: TestData = .{ .value = 99 };
     try testing.expect(obj.setOpaque(&data));
 
     const result = obj.getAnyOpaque(TestData);
@@ -278,7 +278,7 @@ test "Value.getClassId returns class ID for class objects" {
 
     const class_id: Id = .new(rt);
 
-    const def = Def{ .class_name = "ClassIdTest" };
+    const def: Def = .{ .class_name = "ClassIdTest" };
     try rt.newClass(class_id, &def);
 
     const proto = Value.initObject(ctx);
@@ -305,7 +305,7 @@ test "Context.setClassProto and getClassProto" {
 
     const class_id: Id = .new(rt);
 
-    const def = Def{ .class_name = "ProtoTest" };
+    const def: Def = .{ .class_name = "ProtoTest" };
     try rt.newClass(class_id, &def);
 
     const proto = Value.initObject(ctx);
@@ -354,15 +354,13 @@ test "Class with finalizer" {
 
     const class_id: Id = .new(rt);
 
-    const finalizer = struct {
-        fn finalize(_: *Runtime, _: Value) callconv(.c) void {
-            State.finalized = true;
-        }
-    }.finalize;
-
     const def = Def{
         .class_name = "FinalizerTest",
-        .finalizer = @ptrCast(&finalizer),
+        .finalizer = &struct {
+            fn finalize(_: ?*c.JSRuntime, _: c.JSValue) callconv(.c) void {
+                State.finalized = true;
+            }
+        }.finalize,
     };
     try rt.newClass(class_id, &def);
 

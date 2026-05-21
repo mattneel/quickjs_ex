@@ -1,5 +1,6 @@
-// VENDORED: copied from mitchellh/zig-quickjs-ng commit b3731c9.
+// VENDORED: copied from mitchellh/zig-quickjs-ng commit eb1d44ce43fd64f8403c1a94fad242ebae04d1fb.
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const testing = std.testing;
 const c = @import("quickjs_c").c;
@@ -21,9 +22,16 @@ const Opaque = opaquepkg.Opaque;
 ///
 /// C: `JSValue`
 pub const Value = extern struct {
-    /// Keep in sync with JSValue in quickjs.h
-    u: c.JSValueUnion,
-    tag: Tag,
+    // If this is true then we are in nan-boxing mode which changes
+    // our Value representation.
+    pub const is_nan_boxed = builtin.target.ptrBitWidth() < 64;
+
+    // Non-nan-boxed layout
+    u: if (!is_nan_boxed) c.JSValueUnion else void = if (!is_nan_boxed) .{ .int32 = 0 } else {},
+    tag: if (!is_nan_boxed) Tag else void = if (!is_nan_boxed) .undefined else {},
+
+    // NaN-boxed layout
+    val: if (is_nan_boxed) u64 else void = if (is_nan_boxed) mkval(.undefined, 0) else {},
 
     /// JavaScript value type tag.
     ///
@@ -47,12 +55,35 @@ pub const Value = extern struct {
         _,
     };
 
-    pub const null_: Value = .{ .u = .{ .int32 = 0 }, .tag = .null };
-    pub const @"undefined": Value = .{ .u = .{ .int32 = 0 }, .tag = .undefined };
-    pub const @"false": Value = .{ .u = .{ .int32 = 0 }, .tag = .bool };
-    pub const @"true": Value = .{ .u = .{ .int32 = 1 }, .tag = .bool };
-    pub const exception: Value = .{ .u = .{ .int32 = 0 }, .tag = .exception };
-    pub const uninitialized: Value = .{ .u = .{ .int32 = 0 }, .tag = .uninitialized };
+    pub const @"null": Value = if (is_nan_boxed)
+        .{ .val = mkval(.null, 0) }
+    else
+        .{ .u = .{ .int32 = 0 }, .tag = .null };
+
+    pub const @"undefined": Value = if (is_nan_boxed)
+        .{ .val = mkval(.undefined, 0) }
+    else
+        .{ .u = .{ .int32 = 0 }, .tag = .undefined };
+
+    pub const @"false": Value = if (is_nan_boxed)
+        .{ .val = mkval(.bool, 0) }
+    else
+        .{ .u = .{ .int32 = 0 }, .tag = .bool };
+
+    pub const @"true": Value = if (is_nan_boxed)
+        .{ .val = mkval(.bool, 1) }
+    else
+        .{ .u = .{ .int32 = 1 }, .tag = .bool };
+
+    pub const exception: Value = if (is_nan_boxed)
+        .{ .val = mkval(.exception, 0) }
+    else
+        .{ .u = .{ .int32 = 0 }, .tag = .exception };
+
+    pub const uninitialized: Value = if (is_nan_boxed)
+        .{ .val = mkval(.uninitialized, 0) }
+    else
+        .{ .u = .{ .int32 = 0 }, .tag = .uninitialized };
 
     /// Initialize a Value from a Zig type.
     ///
@@ -78,11 +109,11 @@ pub const Value = extern struct {
         return switch (@TypeOf(val)) {
             Value => val,
             bool => initBool(val),
-            void => null_,
+            void => @"null",
 
             else => |T| switch (@typeInfo(T)) {
-                .null => null_,
-                .optional => if (val) |v| init(ctx, v) else null_,
+                .null => @"null",
+                .optional => if (val) |v| init(ctx, v) else @"null",
 
                 .int => |info| if (info.bits <= 32) switch (info.signedness) {
                     .signed => initInt32(@intCast(val)),
@@ -131,20 +162,20 @@ pub const Value = extern struct {
     ///
     /// C: `JS_NewBool`
     pub fn initBool(val: bool) Value {
-        return .{
-            .u = .{ .int32 = @intFromBool(val) },
-            .tag = .bool,
-        };
+        return if (is_nan_boxed)
+            .{ .val = mkval(.bool, @intFromBool(val)) }
+        else
+            .{ .u = .{ .int32 = @intFromBool(val) }, .tag = .bool };
     }
 
     /// Creates a JavaScript 32-bit integer value.
     ///
     /// C: `JS_NewInt32`
     pub fn initInt32(val: i32) Value {
-        return .{
-            .u = .{ .int32 = val },
-            .tag = .int,
-        };
+        return if (is_nan_boxed)
+            .{ .val = mkval(.int, val) }
+        else
+            .{ .u = .{ .int32 = val }, .tag = .int };
     }
 
     /// Creates a JavaScript 64-bit integer value.
@@ -153,11 +184,10 @@ pub const Value = extern struct {
     ///
     /// C: `JS_NewInt64`
     pub fn initInt64(val: i64) Value {
-        if (val >= std.math.minInt(i32) and val <= std.math.maxInt(i32)) {
-            return initInt32(@intCast(val));
-        } else {
-            return initFloat64(@floatFromInt(val));
-        }
+        return if (val >= std.math.minInt(i32) and val <= std.math.maxInt(i32))
+            initInt32(@intCast(val))
+        else
+            initFloat64(@floatFromInt(val));
     }
 
     /// Creates a JavaScript unsigned 32-bit integer value.
@@ -166,21 +196,20 @@ pub const Value = extern struct {
     ///
     /// C: `JS_NewUint32`
     pub fn initUint32(val: u32) Value {
-        if (val <= std.math.maxInt(i32)) {
-            return initInt32(@intCast(val));
-        } else {
-            return initFloat64(@floatFromInt(val));
-        }
+        return if (val <= std.math.maxInt(i32))
+            initInt32(@intCast(val))
+        else
+            initFloat64(@floatFromInt(val));
     }
 
     /// Creates a JavaScript floating-point number value.
     ///
     /// C: `JS_NewFloat64`
     pub fn initFloat64(val: f64) Value {
-        return .{
-            .u = .{ .float64 = val },
-            .tag = .float64,
-        };
+        return if (is_nan_boxed)
+            .{ .val = mkfloat64(val) }
+        else
+            .{ .u = .{ .float64 = val }, .tag = .float64 };
     }
 
     /// Creates a JavaScript number value from a double.
@@ -1583,6 +1612,37 @@ pub const Value = extern struct {
         return fromCVal(c.JS_PromiseResult(ctx.cval(), self.cval()));
     }
 
+    /// A promise with its resolve/reject capability functions.
+    pub const Promise = struct {
+        value: Value,
+        resolve: Value,
+        reject: Value,
+
+        /// Deinitializes all three values.
+        pub fn deinit(self: Promise, ctx: *Context) void {
+            self.value.deinit(ctx);
+            self.resolve.deinit(ctx);
+            self.reject.deinit(ctx);
+        }
+    };
+
+    /// Creates a new Promise with its resolve/reject functions.
+    ///
+    /// Returns a Promise struct containing the promise value and its
+    /// resolve/reject functions. All three values must be freed when
+    /// no longer needed (or call `Promise.deinit` to free all at once).
+    ///
+    /// C: `JS_NewPromiseCapability`
+    pub fn initPromiseCapability(ctx: *Context) Promise {
+        var resolving_funcs: [2]Value = undefined;
+        const promise = fromCVal(c.JS_NewPromiseCapability(ctx.cval(), @ptrCast(&resolving_funcs)));
+        return .{
+            .value = promise,
+            .resolve = resolving_funcs[0],
+            .reject = resolving_funcs[1],
+        };
+    }
+
     // -----------------------------------------------------------------------
     // Class / Opaque data
     // -----------------------------------------------------------------------
@@ -1649,6 +1709,44 @@ pub const Value = extern struct {
     /// Get the underlying C JSValue representation.
     pub inline fn cval(self: Value) c.JSValue {
         return @bitCast(self);
+    }
+
+    // -----------------------------------------------------------------------
+    // NaN-boxing helpers (implementation details)
+    //
+    // On 32-bit platforms, QuickJS uses NaN-boxing to pack values into a u64:
+    // - Upper 32 bits: tag
+    // - Lower 32 bits: int32/bool value or pointer
+    // - Floats use a special encoding with JS_FLOAT64_TAG_ADDEND
+    //
+    // See quickjs.h under `#if defined(JS_NAN_BOXING)` for the C implementation.
+    // -----------------------------------------------------------------------
+
+    /// Constructs a nan-boxed value from a tag and 32-bit payload.
+    ///
+    /// C: `JS_MKVAL(tag, val)` macro in quickjs.h
+    fn mkval(t: Tag, val: i32) u64 {
+        const tag: u64 = @bitCast(@as(i64, @intFromEnum(t)));
+        return (tag << 32) | @as(u32, @bitCast(val));
+    }
+
+    /// Addend used for encoding floats in nan-boxed representation.
+    /// Floats are stored with their bits adjusted by this value to avoid
+    /// colliding with the tag space.
+    ///
+    /// C: `JS_FLOAT64_TAG_ADDEND` macro in quickjs.h
+    const float64_tag_addend: u64 = 0x7ff80000 -% @as(u64, @bitCast(@as(i64, c.JS_TAG_FIRST))) +% 1;
+
+    /// Constructs a nan-boxed float64 value, normalizing NaN to a canonical form.
+    ///
+    /// C: `__JS_NewFloat64(double d)` function in quickjs.h
+    fn mkfloat64(val: f64) u64 {
+        const u: u64 = @bitCast(val);
+        const nan_val = 0x7ff8000000000000 -% (float64_tag_addend << 32);
+        if ((u & 0x7fffffffffffffff) > 0x7ff0000000000000) {
+            return nan_val;
+        }
+        return u -% (float64_tag_addend << 32);
     }
 };
 
@@ -1824,8 +1922,8 @@ test "constants match JavaScript values" {
     const js_null = ctx.eval("null", "<test>", .{});
     defer js_null.deinit(ctx);
     try testing.expect(js_null.isNull());
-    try testing.expect(Value.null_.isNull());
-    try testing.expect(js_null.isStrictEqual(ctx, Value.null_));
+    try testing.expect(Value.@"null".isNull());
+    try testing.expect(js_null.isStrictEqual(ctx, Value.@"null"));
 
     // Test undefined
     const js_undefined = ctx.eval("undefined", "<test>", .{});
@@ -2419,6 +2517,33 @@ test "Promise state" {
     try testing.expectEqual(PromiseState.not_a_promise, num.promiseState(ctx));
 }
 
+test "initPromiseCapability" {
+    const rt: *Runtime = try .init();
+    defer rt.deinit();
+
+    const ctx: *Context = try .init(rt);
+    defer ctx.deinit();
+
+    const promise: Value.Promise = Value.initPromiseCapability(ctx);
+    defer promise.resolve.deinit(ctx);
+    defer promise.reject.deinit(ctx);
+    defer promise.value.deinit(ctx);
+
+    try testing.expect(promise.value.isPromise());
+    try testing.expectEqual(PromiseState.pending, promise.value.promiseState(ctx));
+
+    // Resolve the promise
+    const val: Value = .initInt32(42);
+    const resolve_result = promise.resolve.call(ctx, .undefined, &.{val});
+    defer resolve_result.deinit(ctx);
+
+    try testing.expectEqual(PromiseState.fulfilled, promise.value.promiseState(ctx));
+
+    const result = promise.value.promiseResult(ctx);
+    defer result.deinit(ctx);
+    try testing.expectEqual(@as(i32, 42), try result.toInt32(ctx));
+}
+
 test "instanceof" {
     const rt: *Runtime = try .init();
     defer rt.deinit();
@@ -2453,8 +2578,12 @@ test "init with Value passthrough" {
     const original = Value.initInt32(42);
     const result = Value.init(ctx, original);
 
-    try testing.expectEqual(original.tag, result.tag);
-    try testing.expectEqual(original.u.int32, result.u.int32);
+    if (Value.is_nan_boxed) {
+        try testing.expectEqual(original.val, result.val);
+    } else {
+        try testing.expectEqual(original.tag, result.tag);
+        try testing.expectEqual(original.u.int32, result.u.int32);
+    }
 }
 
 test "init with bool" {
@@ -3059,6 +3188,73 @@ fn testSquareFunc(ctx_opt: ?*Context, _: Value, args: []const c.JSValue) Value {
     const ctx = ctx_opt.?;
     const val = Value.fromCVal(args[0]).toInt32(ctx) catch return Value.exception;
     return Value.initInt32(val * val);
+}
+
+test "getset property accessors" {
+    const rt: *Runtime = try .init();
+    defer rt.deinit();
+
+    const ctx: *Context = try .init(rt);
+    defer ctx.deinit();
+
+    const obj: Value = .initObject(ctx);
+    defer obj.deinit(ctx);
+
+    const list = [_]cfunc.FunctionListEntry{
+        cfunc.FunctionListEntryHelpers.getset("readOnly", &testGetter, null),
+        cfunc.FunctionListEntryHelpers.getset("readWrite", &testGetter, &testSetter),
+        cfunc.FunctionListEntryHelpers.getsetMagic("magicProp", &testGetterMagic, &testSetterMagic, 42),
+    };
+
+    try obj.setPropertyFunctionList(ctx, &list);
+
+    const global = ctx.getGlobalObject();
+    defer global.deinit(ctx);
+    try global.setPropertyStr(ctx, "testObj", obj.dup(ctx));
+
+    // Test read-only getter
+    const result1 = ctx.eval("testObj.readOnly", "<test>", .{});
+    defer result1.deinit(ctx);
+    try testing.expect(!result1.isException());
+    try testing.expectEqual(@as(i32, 123), try result1.toInt32(ctx));
+
+    // Test read-write getter
+    const result2 = ctx.eval("testObj.readWrite", "<test>", .{});
+    defer result2.deinit(ctx);
+    try testing.expect(!result2.isException());
+    try testing.expectEqual(@as(i32, 123), try result2.toInt32(ctx));
+
+    // Test setter returns value
+    const result3 = ctx.eval("testObj.readWrite = 999", "<test>", .{});
+    defer result3.deinit(ctx);
+    try testing.expect(!result3.isException());
+
+    // Test magic getter (returns the magic value)
+    const result4 = ctx.eval("testObj.magicProp", "<test>", .{});
+    defer result4.deinit(ctx);
+    try testing.expect(!result4.isException());
+    try testing.expectEqual(@as(i32, 42), try result4.toInt32(ctx));
+
+    // Test magic setter
+    const result5 = ctx.eval("testObj.magicProp = 100", "<test>", .{});
+    defer result5.deinit(ctx);
+    try testing.expect(!result5.isException());
+}
+
+fn testGetter(_: ?*Context, _: Value) Value {
+    return .initInt32(123);
+}
+
+fn testSetter(_: ?*Context, _: Value, _: Value) Value {
+    return .undefined;
+}
+
+fn testGetterMagic(_: ?*Context, _: Value, magic: c_int) Value {
+    return .initInt32(magic);
+}
+
+fn testSetterMagic(_: ?*Context, _: Value, _: Value, _: c_int) Value {
+    return .undefined;
 }
 
 test "setConstructor" {

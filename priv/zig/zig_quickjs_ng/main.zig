@@ -1,4 +1,4 @@
-// VENDORED: copied from mitchellh/zig-quickjs-ng commit b3731c9.
+// VENDORED: copied from mitchellh/zig-quickjs-ng commit eb1d44ce43fd64f8403c1a94fad242ebae04d1fb.
 const atom = @import("atom.zig");
 const class = @import("class.zig");
 const context = @import("context.zig");
@@ -17,6 +17,7 @@ pub const ModuleDef = module.ModuleDef;
 pub const Runtime = runtime.Runtime;
 pub const DumpFlags = runtime.DumpFlags;
 pub const Value = value.Value;
+pub const Promise = value.Value.Promise;
 pub const PromiseState = value.PromiseState;
 pub const ClassId = class.Id;
 pub const ClassDef = class.Def;

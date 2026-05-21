@@ -88,13 +88,12 @@ defmodule QuickjsEx.NIF do
     zig_code_path: "nif.zig",
     extra_modules: [
       quickjs_c: {@generated_quickjs_c_path, []},
-      zig_quickjs_ng: {"../../priv/zig/zig_quickjs_ng/quickjs.zig", [:quickjs_c]}
+      zig_quickjs_ng: {"../../priv/zig/zig_quickjs_ng/main.zig", [:quickjs_c]}
     ],
     # QuickJS-NG C sources vendored at c_src/quickjs_ng/.
     c: [
       src: [
         "../../c_src/quickjs_ng/quickjs.c",
-        "../../c_src/quickjs_ng/cutils.c",
         "../../c_src/quickjs_ng/dtoa.c",
         "../../c_src/quickjs_ng/libregexp.c",
         "../../c_src/quickjs_ng/libunicode.c"

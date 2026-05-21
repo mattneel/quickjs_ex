@@ -1,4 +1,4 @@
-// VENDORED: copied from mitchellh/zig-quickjs-ng commit b3731c9.
+// VENDORED: copied from mitchellh/zig-quickjs-ng commit eb1d44ce43fd64f8403c1a94fad242ebae04d1fb.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const c = @import("quickjs_c").c;
@@ -516,22 +516,22 @@ pub const Runtime = opaque {
 
         const Wrapper = struct {
             fn callback(
-                ctx: *Context,
-                hook_type: PromiseHookType,
-                promise: Value,
-                parent_or_value: Value,
+                ctx: ?*c.JSContext,
+                hook_type: c.JSPromiseHookType,
+                promise: c.JSValue,
+                parent_or_value: c.JSValue,
                 inner_userdata: ?*anyopaque,
             ) callconv(.c) void {
                 @call(.always_inline, h, .{
                     opaquepkg.fromC(T, inner_userdata),
-                    ctx,
-                    hook_type,
-                    promise,
-                    parent_or_value,
+                    @as(*Context, @ptrCast(ctx)),
+                    @as(PromiseHookType, @enumFromInt(hook_type)),
+                    @as(Value, @bitCast(promise)),
+                    @as(Value, @bitCast(parent_or_value)),
                 });
             }
         };
-        c.JS_SetPromiseHook(self.cval(), @ptrCast(&Wrapper.callback), opaquepkg.toC(T, userdata));
+        c.JS_SetPromiseHook(self.cval(), &Wrapper.callback, opaquepkg.toC(T, userdata));
     }
 
     /// Promise rejection tracker callback type.
@@ -566,22 +566,22 @@ pub const Runtime = opaque {
 
         const Wrapper = struct {
             fn callback(
-                ctx: *Context,
-                promise: Value,
-                reason: Value,
-                is_handled: c_int,
+                ctx: ?*c.JSContext,
+                promise: c.JSValue,
+                reason: c.JSValue,
+                is_handled: bool,
                 inner_userdata: ?*anyopaque,
             ) callconv(.c) void {
                 @call(.always_inline, t, .{
                     opaquepkg.fromC(T, inner_userdata),
-                    ctx,
-                    promise,
-                    reason,
-                    is_handled != 0,
+                    @as(*Context, @ptrCast(ctx)),
+                    @as(Value, @bitCast(promise)),
+                    @as(Value, @bitCast(reason)),
+                    is_handled,
                 });
             }
         };
-        c.JS_SetHostPromiseRejectionTracker(self.cval(), @ptrCast(&Wrapper.callback), opaquepkg.toC(T, userdata));
+        c.JS_SetHostPromiseRejectionTracker(self.cval(), &Wrapper.callback, opaquepkg.toC(T, userdata));
     }
 
     // =========================================================================
@@ -726,7 +726,7 @@ test "Runtime opaque data" {
         value: i32,
     };
 
-    var data = TestData{ .value = 42 };
+    var data: TestData = .{ .value = 42 };
 
     // Initially null
     try std.testing.expectEqual(@as(?*TestData, null), rt.getOpaque(TestData));

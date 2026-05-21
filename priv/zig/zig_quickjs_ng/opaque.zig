@@ -1,4 +1,4 @@
-// VENDORED: copied from mitchellh/zig-quickjs-ng commit b3731c9.
+// VENDORED: copied from mitchellh/zig-quickjs-ng commit eb1d44ce43fd64f8403c1a94fad242ebae04d1fb.
 // Helpers for userdata handling.
 
 /// Given an opaque type T, returns the expected type T that the user

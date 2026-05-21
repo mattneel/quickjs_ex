@@ -168,6 +168,17 @@ useful as a deterministic billing or budgeting baseline even before deeper prici
 | macOS | Best effort |
 | Windows | Out of scope |
 
+## Vendored QuickJS updates
+
+QuickJS-NG and the Zig bindings are vendored as checked-in snapshots, not git
+submodules. Validate the snapshot with:
+
+```sh
+mix quickjs.vendor.check
+```
+
+See [docs/vendor_quickjs.md](docs/vendor_quickjs.md) for the update workflow.
+
 ## Migration from mquickjs_ex
 
 For migration steps and intentional breaking changes, see [MIGRATION.md](MIGRATION.md).

@@ -180,8 +180,8 @@ defmodule QuickjsEx.SecurityTest do
 
   describe "resource limits" do
     test "memory limit prevents large allocations" do
-      # Using small memory (32KB)
-      {:ok, ctx} = QuickjsEx.new(memory_limit: 32768)
+      # Tight enough to force allocation failure, but high enough for current QuickJS-NG startup.
+      {:ok, ctx} = QuickjsEx.new(memory_limit: 131_072)
 
       # Try to allocate a very large array - should fail gracefully
       result =
@@ -209,7 +209,7 @@ defmodule QuickjsEx.SecurityTest do
     end
 
     test "infinite loop protection via memory/timeout" do
-      {:ok, ctx} = QuickjsEx.new(memory_limit: 32768)
+      {:ok, ctx} = QuickjsEx.new(memory_limit: 131_072)
 
       # This should either timeout or run out of memory
       # Note: MQuickJS doesn't have built-in timeout, so this tests memory limits

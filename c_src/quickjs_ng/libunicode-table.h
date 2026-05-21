@@ -1,4 +1,4 @@
-/* VENDORED: copied from quickjs-ng/quickjs commit 85640f81e04bc93940acc2756c792c66076dd768. */
+/* VENDORED: copied from quickjs-ng/quickjs commit 433941b99fb3c5e7f98b7ebd78727972bcf467ee. */
 /* Compressed unicode tables */
 /* Automatically generated file - do not edit */
 

@@ -1,4 +1,4 @@
-// VENDORED: copied from mitchellh/zig-quickjs-ng commit b3731c9.
+// VENDORED: copied from mitchellh/zig-quickjs-ng commit eb1d44ce43fd64f8403c1a94fad242ebae04d1fb.
 const std = @import("std");
 const testing = std.testing;
 const c = @import("quickjs_c").c;

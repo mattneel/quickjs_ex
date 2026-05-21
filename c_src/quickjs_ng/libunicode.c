@@ -1,4 +1,4 @@
-/* VENDORED: copied from quickjs-ng/quickjs commit 85640f81e04bc93940acc2756c792c66076dd768. */
+/* VENDORED: copied from quickjs-ng/quickjs commit 433941b99fb3c5e7f98b7ebd78727972bcf467ee. */
 /*
  * Unicode utilities
  *
@@ -960,7 +960,7 @@ int unicode_normalize(uint32_t **pdst, const uint32_t *src, int src_len,
     is_compat = n_type >> 1;
 
     dbuf_init2(dbuf, opaque, realloc_func);
-    if (dbuf_realloc(dbuf, sizeof(int) * src_len))
+    if (dbuf_claim(dbuf, sizeof(int) * src_len))
         goto fail;
 
     /* common case: latin1 is unaffected by NFC */

@@ -25,7 +25,6 @@ pub fn build(b: *std.Build) void {
         .root = b.path("c_src/quickjs_ng"),
         .files = &.{
             "quickjs.c",
-            "cutils.c",
             "dtoa.c",
             "libregexp.c",
             "libunicode.c",
