@@ -24,6 +24,12 @@ const CommandKind = enum {
     stop,
 };
 
+const CallbackAbortReason = enum {
+    none,
+    shutdown,
+    owner_down,
+};
+
 const Command = struct {
     kind: CommandKind,
     ctx_res_ptr: usize = 0,
@@ -72,6 +78,7 @@ pub const JsContext = struct {
     callback_result_env: beam.env,
     callback_result: beam.term,
     callback_result_ready: bool,
+    callback_abort_reason: CallbackAbortReason,
     callback_error_env: beam.env,
     callback_error: ?beam.term,
     gas_quanta_total: u64,
@@ -108,14 +115,28 @@ fn process_is_alive(pid: beam.pid) bool {
     return e.enif_is_process_alive(check_env, &local_pid) != 0;
 }
 
-fn request_context_shutdown(ctx_res: *JsContext) void {
+fn set_callback_abort_locked(ctx_res: *JsContext, reason: CallbackAbortReason) void {
+    if (reason == .none) return;
+
+    if (ctx_res.callback_result_env) |result_env| {
+        e.enif_free_env(result_env);
+    }
+
+    ctx_res.callback_result_env = null;
+    ctx_res.callback_result = .{ .v = undefined };
+    ctx_res.callback_result_ready = false;
+    ctx_res.callback_abort_reason = reason;
+    ctx_res.callback_condvar.signal();
+}
+
+fn request_context_shutdown(ctx_res: *JsContext, reason: CallbackAbortReason) void {
     ctx_res.queue_mutex.lock();
     ctx_res.shutting_down = true;
     ctx_res.queue_condvar.signal();
     ctx_res.queue_mutex.unlock();
 
     ctx_res.callback_mutex.lock();
-    ctx_res.callback_condvar.signal();
+    set_callback_abort_locked(ctx_res, reason);
     ctx_res.callback_mutex.unlock();
 }
 
@@ -168,7 +189,7 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     var caller_pid = ctx_res.active_caller_pid;
 
     if (!process_is_alive(caller_pid)) {
-        request_context_shutdown(ctx_res);
+        request_context_shutdown(ctx_res, .owner_down);
         return ctx.throwTypeError("callback caller unavailable");
     }
 
@@ -190,6 +211,7 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     ctx_res.callback_req_id += 1;
     const req_id = ctx_res.callback_req_id;
     ctx_res.callback_result_ready = false;
+    ctx_res.callback_abort_reason = .none;
     if (ctx_res.callback_result_env) |previous_env| {
         e.enif_free_env(previous_env);
     }
@@ -211,21 +233,29 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     }
 
     ctx_res.callback_mutex.lock();
-    while (!ctx_res.callback_result_ready) {
+    while (!ctx_res.callback_result_ready and ctx_res.callback_abort_reason == .none) {
         ctx_res.callback_condvar.timedWait(&ctx_res.callback_mutex, CALLBACK_OWNER_CHECK_NS) catch {
             if (!process_is_alive(caller_pid)) {
-                ctx_res.queue_mutex.lock();
-                ctx_res.shutting_down = true;
-                ctx_res.queue_condvar.signal();
-                ctx_res.queue_mutex.unlock();
                 ctx_res.callback_mutex.unlock();
-                return ctx.throwTypeError("callback caller unavailable");
+                request_context_shutdown(ctx_res, .owner_down);
+                ctx_res.callback_mutex.lock();
+                continue;
             }
 
             if (ctx_res.shutting_down) {
-                ctx_res.callback_mutex.unlock();
-                return ctx.throwTypeError("javascript context stopped");
+                set_callback_abort_locked(ctx_res, .shutdown);
             }
+        };
+    }
+
+    if (ctx_res.callback_abort_reason != .none) {
+        const abort_reason = ctx_res.callback_abort_reason;
+        ctx_res.callback_mutex.unlock();
+
+        return switch (abort_reason) {
+            .owner_down => ctx.throwTypeError("callback caller unavailable"),
+            .shutdown => ctx.throwTypeError("javascript context stopped"),
+            .none => unreachable,
         };
     }
 
@@ -451,13 +481,9 @@ fn drain_command_queue(ctx_res: *JsContext) void {
 fn shutdown_context_thread(ctx_res: *JsContext) void {
     ctx_res.queue_mutex.lock();
     const should_join = ctx_res.thread_started and !ctx_res.thread_joined;
-    ctx_res.shutting_down = true;
-    ctx_res.queue_condvar.signal();
     ctx_res.queue_mutex.unlock();
 
-    ctx_res.callback_mutex.lock();
-    ctx_res.callback_condvar.signal();
-    ctx_res.callback_mutex.unlock();
+    request_context_shutdown(ctx_res, .shutdown);
 
     if (should_join) {
         var result: ?*anyopaque = null;
@@ -876,7 +902,7 @@ fn interrupt_handler(opaque_ptr: ?*JsContext, runtime: *Runtime) bool {
     if (now > 0 and now - ctx_res.owner_check_ms >= @as(i64, @intCast(CALLBACK_OWNER_CHECK_NS / std.time.ns_per_ms))) {
         ctx_res.owner_check_ms = now;
         if (!process_is_alive(ctx_res.owner_pid)) {
-            request_context_shutdown(ctx_res);
+            request_context_shutdown(ctx_res, .owner_down);
             return true;
         }
     }
@@ -937,6 +963,7 @@ pub fn nif_new(memory_limit_bytes: u64, stack_limit_bytes: u64, timeout_ms: u64)
         .callback_result_env = null,
         .callback_result = .{ .v = undefined },
         .callback_result_ready = false,
+        .callback_abort_reason = .none,
         .callback_error_env = null,
         .callback_error = null,
         .gas_quanta_total = 0,
@@ -1253,6 +1280,11 @@ pub fn nif_signal_callback_result(resource_ref: beam.term, request_ref: beam.ter
 
     ctx_res.callback_mutex.lock();
     defer ctx_res.callback_mutex.unlock();
+
+    if (ctx_res.callback_abort_reason != .none or ctx_res.shutting_down) {
+        e.enif_free_env(msg_env);
+        return beam.make(.{ .@"error", .stale }, .{ .env = env });
+    }
 
     if (ctx_res.callback_req_id != req_id) {
         e.enif_free_env(msg_env);

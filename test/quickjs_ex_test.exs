@@ -40,6 +40,65 @@ defmodule QuickjsExTest do
     await_raw_result(ctx_ref, request_ref, callbacks)
   end
 
+  defp spawn_owner_with_parked_callback(parent, opts \\ []) do
+    send_context? = Keyword.get(opts, :send_context?, false)
+
+    owner =
+      spawn(fn ->
+        {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+        ctx =
+          QuickjsEx.set!(ctx, :park, fn [] ->
+            send(parent, {:entered, self()})
+
+            receive do
+              :release -> 41
+            end
+          end)
+
+        if send_context? do
+          send(parent, {:ctx, self(), ctx})
+        else
+          send(parent, {:ready, self()})
+        end
+
+        send(parent, {:eval_result, self(), QuickjsEx.eval(ctx, "park()")})
+      end)
+
+    {owner, Process.monitor(owner)}
+  end
+
+  defp assert_vm_responsive do
+    task =
+      Task.async(fn ->
+        Enum.reduce(1..50_000, 0, &+/2)
+      end)
+
+    assert Task.await(task, 100) == div(50_000 * 50_001, 2)
+  end
+
+  defp assert_fresh_context_eval_with_callback do
+    {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+    ctx = QuickjsEx.set!(ctx, :add_one, fn [x] -> x + 1 end)
+    assert {:ok, 42} = QuickjsEx.eval(ctx, "add_one(41)")
+  end
+
+  defp assert_context_eventually_stopped(ctx) do
+    result =
+      Enum.reduce_while(1..20, nil, fn _, _ ->
+        case QuickjsEx.eval(ctx, "1") do
+          {:error, :context_poisoned} = stopped ->
+            {:halt, stopped}
+
+          other ->
+            Process.sleep(50)
+            {:cont, other}
+        end
+      end)
+
+    assert {:error, :context_poisoned} = result
+  end
+
   describe "NIF smoke tests" do
     test "ping responds from the NIF" do
       assert :ok = QuickjsEx.NIF.ping()
@@ -995,6 +1054,42 @@ defmodule QuickjsExTest do
         end)
 
       assert {:error, :context_poisoned} = result
+    end
+
+    test "owner death while parked in callback tears down retained context" do
+      parent = self()
+      {owner, monitor_ref} = spawn_owner_with_parked_callback(parent, send_context?: true)
+
+      assert_receive {:ctx, ^owner, ctx}, 1_000
+      assert_receive {:entered, ^owner}, 1_000
+
+      responsiveness_task =
+        Task.async(fn ->
+          Enum.reduce(1..50_000, 0, &+/2)
+        end)
+
+      Process.exit(owner, :kill)
+
+      assert Task.await(responsiveness_task, 100) == div(50_000 * 50_001, 2)
+      assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :killed}, 1_000
+      assert_context_eventually_stopped(ctx)
+      assert_fresh_context_eval_with_callback()
+    end
+
+    test "resource GC teardown while parked in callback joins context thread" do
+      parent = self()
+      {owner, monitor_ref} = spawn_owner_with_parked_callback(parent)
+
+      assert_receive {:ready, ^owner}, 1_000
+      assert_receive {:entered, ^owner}, 1_000
+
+      assert_vm_responsive()
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :killed}, 1_000
+
+      :erlang.garbage_collect()
+      assert_vm_responsive()
+      assert_fresh_context_eval_with_callback()
     end
 
     test "context_poisoned after OOM" do
