@@ -373,9 +373,9 @@ defmodule QuickjsEx.SecurityTest do
   end
 
   describe "QuickJS-Ex specific security" do
-    test "async_not_supported" do
+    test "internal promises settle without host capabilities" do
       {:ok, ctx} = QuickjsEx.new()
-      assert {:error, :async_not_supported} = QuickjsEx.eval(ctx, "Promise.resolve(1)")
+      assert {:ok, 1} = QuickjsEx.eval(ctx, "Promise.resolve(1)")
     end
 
     test "not_owner enforcement" do

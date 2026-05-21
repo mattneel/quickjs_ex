@@ -34,7 +34,7 @@ defmodule QuickjsEx do
 
   @poisoned_ref_key {__MODULE__, :poisoned_ref}
   @callback_aliases_key {__MODULE__, :callback_aliases}
-  @default_stack_limit 256 * 1024
+  @default_stack_limit 1024 * 1024
   @bootstrap_min_memory 64 * 1024
   @runtime_bootstrap """
   (function () {
@@ -56,7 +56,7 @@ defmodule QuickjsEx do
   | Option | Type | Default | Description |
   | --- | --- | --- | --- |
   | `:memory_limit` | integer | `4_000_000` | Runtime heap limit in bytes. |
-  | `:stack_limit` | integer | `262_144` | C stack limit in bytes. |
+  | `:stack_limit` | integer | `1_048_576` | QuickJS soft stack limit in bytes; the context thread requests an OS stack with headroom above this value. |
   | `:timeout` | integer | `0` | Default evaluation timeout in milliseconds (`0` disables timeout). |
 
   ## Returns
@@ -69,7 +69,8 @@ defmodule QuickjsEx do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
@@ -125,7 +126,8 @@ defmodule QuickjsEx do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
@@ -147,10 +149,11 @@ defmodule QuickjsEx do
       {:error, :context_poisoned}
     else
       timeout = Keyword.get(opts, :timeout, 0)
+      eval_as_module? = Keyword.get(opts, :type, :script) == :module
 
       request_ref = make_ref()
 
-      case NIF.nif_eval(ctx.ref, request_ref, code, timeout) do
+      case NIF.nif_eval(ctx.ref, request_ref, code, timeout, eval_as_module?) do
         :ok ->
           await_eval_result(ctx, request_ref)
 
@@ -251,7 +254,8 @@ defmodule QuickjsEx do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
@@ -341,7 +345,8 @@ defmodule QuickjsEx do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
@@ -450,6 +455,60 @@ defmodule QuickjsEx do
   end
 
   @doc """
+  Registers a JavaScript global function that returns a promise resolved by Elixir.
+
+  The callback receives a list of JavaScript arguments. It may return a raw value,
+  `{:ok, value}`, or `{:error, reason}`. Each invocation runs in its own Elixir
+  task while the owning process remains in the eval receive loop.
+  """
+  def set_async(%Context{} = ctx, name, fun)
+      when (is_atom(name) or is_binary(name)) and is_function(fun) do
+    if context_poisoned?(ctx) do
+      {:error, :context_poisoned}
+    else
+      name_str = to_string(name)
+
+      request_ref = make_ref()
+
+      case NIF.nif_register_async_callback(ctx.ref, request_ref, name_str, nil) do
+        :ok ->
+          case await_simple_result(ctx, request_ref) do
+            :ok ->
+              callback_ctx =
+                ctx
+                |> Context.put_async_callback(name_str, fun)
+                |> sync_poisoned_context()
+
+              {:ok, callback_ctx}
+
+            {:error, reason} ->
+              _ = track_poisoned_error(ctx, reason)
+              {:error, reason}
+          end
+
+        {:error, raw_reason} ->
+          reason = normalise_error(raw_reason)
+          _ = track_poisoned_error(ctx, reason)
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Registers an Elixir module loader used by static and dynamic JavaScript imports.
+
+  The loader receives the normalized module specifier and must return
+  `{:ok, source}` or `{:error, reason}`.
+  """
+  def set_module_loader(%Context{} = ctx, fun) when is_function(fun, 1) do
+    if context_poisoned?(ctx) do
+      {:error, :context_poisoned}
+    else
+      {:ok, Context.put_module_loader(ctx, fun)}
+    end
+  end
+
+  @doc """
   Raising variant of `set/3`.
 
   ## Returns
@@ -497,7 +556,8 @@ defmodule QuickjsEx do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
@@ -593,7 +653,8 @@ defmodule QuickjsEx do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
@@ -762,8 +823,88 @@ defmodule QuickjsEx do
         result = run_callback(ctx, callback_name, args)
         _ = NIF.nif_signal_callback_result(ctx.ref, request_ref, req_id, result)
         await_nif_result(ctx, request_ref)
+
+      {:quickjs_ex_async_request, ^request_ref, req_id, callback_name, args} ->
+        case Task.start(fn ->
+               result = run_async_callback(ctx, callback_name, args)
+               _ = NIF.nif_resolve_async(ctx.ref, request_ref, req_id, result)
+             end) do
+          {:ok, _pid} ->
+            :ok
+
+          {:error, reason} ->
+            _ =
+              NIF.nif_resolve_async(
+                ctx.ref,
+                request_ref,
+                req_id,
+                {:error, "failed to start async callback task: #{inspect(reason)}"}
+              )
+        end
+
+        await_nif_result(ctx, request_ref)
+
+      {:quickjs_ex_module_request, ^request_ref, req_id, specifier} ->
+        result = run_module_loader(ctx, specifier)
+        _ = NIF.nif_signal_module_result(ctx.ref, request_ref, req_id, result)
+        await_nif_result(ctx, request_ref)
     end
   end
+
+  defp run_module_loader(%Context{module_loader: nil}, specifier) do
+    {:error, "module loader is not registered for `#{specifier}`"}
+  end
+
+  defp run_module_loader(%Context{module_loader: loader}, specifier) do
+    case loader.(to_string(specifier)) do
+      {:ok, source} when is_binary(source) ->
+        {:ok, source}
+
+      {:ok, _source} ->
+        {:error, "module loader source must be a string"}
+
+      {:error, reason} ->
+        {:error, async_error_message(reason)}
+
+      other ->
+        {:error, "invalid module loader response: #{inspect(other)}"}
+    end
+  rescue
+    e ->
+      {:error, Exception.message(e)}
+  catch
+    kind, reason ->
+      {:error, Exception.format_banner(kind, reason)}
+  end
+
+  defp run_async_callback(%Context{} = ctx, callback_name, args) do
+    callback_name = to_string(callback_name)
+
+    case Map.fetch(ctx.async_callbacks, callback_name) do
+      {:ok, fun} ->
+        invoke_async_callback(fun, args)
+
+      :error ->
+        {:error, "async callback `#{callback_name}` is not registered"}
+    end
+  end
+
+  defp invoke_async_callback(fun, args) do
+    case fun.(args) do
+      {:ok, value} -> {:ok, value}
+      {:error, reason} -> {:error, async_error_message(reason)}
+      value -> {:ok, value}
+    end
+  rescue
+    e ->
+      {:error, Exception.message(e)}
+  catch
+    kind, reason ->
+      {:error, Exception.format_banner(kind, reason)}
+  end
+
+  defp async_error_message(reason) when is_binary(reason), do: reason
+  defp async_error_message(reason), do: inspect(reason)
 
   defp run_callback(%Context{} = ctx, callback_name, args) do
     callback_name = to_string(callback_name)
@@ -947,7 +1088,9 @@ defmodule QuickjsEx do
   defp normalise_error(:not_owner), do: :not_owner
   defp normalise_error(:context_busy), do: :context_busy
   defp normalise_error(:sandbox), do: :sandbox_violation
-  defp normalise_error(:async), do: :async_not_supported
+  defp normalise_error(:async), do: :unsettled_promise
+  defp normalise_error(:unsettled), do: :unsettled_promise
+  defp normalise_error(:module_load), do: :module_load_error
   defp normalise_error(:internal), do: :internal_error
   defp normalise_error({:js, message}), do: {:js_error, message}
   defp normalise_error({:cb, name, message}), do: {:callback_error, name, message}

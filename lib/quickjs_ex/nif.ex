@@ -111,7 +111,10 @@ defmodule QuickjsEx.NIF do
       nif_set_path: [],
       nif_gc: [],
       nif_register_callback: [],
+      nif_register_async_callback: [],
       nif_signal_callback_result: [],
+      nif_signal_module_result: [],
+      nif_resolve_async: [],
       nif_transfer_owner: []
     ]
 end

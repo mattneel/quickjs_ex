@@ -18,11 +18,21 @@ defmodule QuickjsEx.Context do
 
   @type callback_entry :: function() | callback_meta()
 
-  defstruct [:ref, callbacks: %{}, loaded_apis: [], private: %{}, poisoned?: false]
+  defstruct [
+    :ref,
+    callbacks: %{},
+    async_callbacks: %{},
+    module_loader: nil,
+    loaded_apis: [],
+    private: %{},
+    poisoned?: false
+  ]
 
   @type t :: %__MODULE__{
           ref: reference(),
           callbacks: %{String.t() => callback_entry()},
+          async_callbacks: %{String.t() => function()},
+          module_loader: function() | nil,
           loaded_apis: [module()],
           private: map(),
           poisoned?: boolean()
@@ -44,6 +54,22 @@ defmodule QuickjsEx.Context do
   @spec put_callback(t(), atom() | String.t(), function()) :: t()
   def put_callback(%__MODULE__{} = ctx, name, fun) when is_function(fun) do
     %{ctx | callbacks: Map.put(ctx.callbacks, to_string(name), fun)}
+  end
+
+  @doc """
+  Register an async callback function.
+  """
+  @spec put_async_callback(t(), atom() | String.t(), function()) :: t()
+  def put_async_callback(%__MODULE__{} = ctx, name, fun) when is_function(fun) do
+    %{ctx | async_callbacks: Map.put(ctx.async_callbacks, to_string(name), fun)}
+  end
+
+  @doc """
+  Register a module loader function.
+  """
+  @spec put_module_loader(t(), function()) :: t()
+  def put_module_loader(%__MODULE__{} = ctx, fun) when is_function(fun, 1) do
+    %{ctx | module_loader: fun}
   end
 
   @doc """

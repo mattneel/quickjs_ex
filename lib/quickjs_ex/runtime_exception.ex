@@ -12,7 +12,8 @@ defmodule QuickjsEx.RuntimeException do
     - `:not_owner`
     - `:context_busy`
     - `:sandbox_violation`
-    - `:async_not_supported`
+    - `:unsettled_promise`
+    - `:module_load_error`
     - `:internal_error`
     - `:js_error`
     - `:callback_error`
@@ -83,10 +84,17 @@ defmodule QuickjsEx.RuntimeException do
           detail: nil
         }
 
-      :async_not_supported ->
+      :unsettled_promise ->
         %__MODULE__{
-          message: "Promise/async execution is not supported",
-          category: :async_not_supported,
+          message: "JavaScript promise did not settle",
+          category: :unsettled_promise,
+          detail: nil
+        }
+
+      :module_load_error ->
+        %__MODULE__{
+          message: "JavaScript module failed to load",
+          category: :module_load_error,
           detail: nil
         }
 

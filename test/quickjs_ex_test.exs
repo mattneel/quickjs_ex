@@ -109,7 +109,7 @@ defmodule QuickjsExTest do
 
       assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_set_value(ref, &1, "x", 41))
       assert {:ok, 41} = dispatch_raw(ref, &QuickjsEx.NIF.nif_get(ref, &1, "x"))
-      assert {:ok, 42} = dispatch_raw(ref, &QuickjsEx.NIF.nif_eval(ref, &1, "x + 1", 0))
+      assert {:ok, 42} = dispatch_raw(ref, &QuickjsEx.NIF.nif_eval(ref, &1, "x + 1", 0, false))
 
       assert {:ok, %{last: 1, total: 1, quantum: 10_000}} =
                dispatch_raw(ref, &QuickjsEx.NIF.nif_get_gas(ref, &1))
@@ -120,7 +120,7 @@ defmodule QuickjsExTest do
     test "raw NIF gas tracks heavier evaluations" do
       assert {:ok, ref} = QuickjsEx.NIF.nif_new(@default_memory, 0, 0)
 
-      assert {:ok, 2} = dispatch_raw(ref, &QuickjsEx.NIF.nif_eval(ref, &1, "1 + 1", 0))
+      assert {:ok, 2} = dispatch_raw(ref, &QuickjsEx.NIF.nif_eval(ref, &1, "1 + 1", 0, false))
 
       assert {:ok, %{last: 1, total: 1, quantum: 10_000}} =
                dispatch_raw(ref, &QuickjsEx.NIF.nif_get_gas(ref, &1))
@@ -132,7 +132,8 @@ defmodule QuickjsExTest do
                    ref,
                    &1,
                    "let s = 0; for (let i = 0; i < 500000; i++) { s += i; } s",
-                   0
+                   0,
+                   false
                  )
                )
 
@@ -156,7 +157,7 @@ defmodule QuickjsExTest do
       assert {:ok, 42} =
                dispatch_raw(
                  ref,
-                 &QuickjsEx.NIF.nif_eval(ref, &1, "double(21)", 0),
+                 &QuickjsEx.NIF.nif_eval(ref, &1, "double(21)", 0, false),
                  %{"double" => fn [x] -> x * 2 end}
                )
     end
@@ -167,7 +168,7 @@ defmodule QuickjsExTest do
       assert {:error, {:cb, "fail", _}} =
                dispatch_raw(
                  ref,
-                 &QuickjsEx.NIF.nif_eval(ref, &1, "fail()", 0),
+                 &QuickjsEx.NIF.nif_eval(ref, &1, "fail()", 0, false),
                  %{"fail" => fn [] -> raise "intentional error" end}
                )
     end
@@ -176,7 +177,7 @@ defmodule QuickjsExTest do
       assert :ok = dispatch_raw(ref, &QuickjsEx.NIF.nif_register_callback(ref, &1, "double", nil))
 
       request_ref = make_ref()
-      assert :ok = QuickjsEx.NIF.nif_eval(ref, request_ref, "double(21)", 0)
+      assert :ok = QuickjsEx.NIF.nif_eval(ref, request_ref, "double(21)", 0, false)
 
       assert_receive {:quickjs_ex_callback, ^request_ref, req_id, "double", [21]}, 1_000
 
@@ -1098,9 +1099,301 @@ defmodule QuickjsExTest do
       assert {:error, :context_poisoned} = QuickjsEx.set(ctx, :x, 1)
     end
 
-    test "async_not_supported" do
+    test "internal async promises settle through the QuickJS job queue" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
-      assert {:error, :async_not_supported} = QuickjsEx.eval(ctx, "Promise.resolve(1)")
+
+      assert {:ok, 42} =
+               QuickjsEx.eval(ctx, """
+               (async () => await Promise.resolve(41) + 1)()
+               """)
+    end
+
+    test "unresolvable internal promises return unsettled_promise" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:error, :unsettled_promise} =
+               QuickjsEx.eval(ctx, """
+               (async () => await new Promise(() => {}))()
+               """)
+    end
+
+    test "async rejections return js_error like synchronous throws" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:error, {:js_error, message}} =
+               QuickjsEx.eval(ctx, """
+               (async () => { throw new Error("async boom"); })()
+               """)
+
+      assert message =~ "async boom"
+    end
+
+    test "microtasks drain even when the root result is synchronous" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:ok, "queued"} =
+               QuickjsEx.eval(ctx, """
+               globalThis.afterMicrotask = 0;
+               Promise.resolve().then(() => { globalThis.afterMicrotask = 2; });
+               "queued";
+               """)
+
+      assert {:ok, 2} = QuickjsEx.get(ctx, :afterMicrotask)
+    end
+
+    test "async host capability resolves an awaited promise" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+      {:ok, ctx} = QuickjsEx.set_async(ctx, :host_async, fn [value] -> value + 1 end)
+
+      assert {:ok, 42} =
+               QuickjsEx.eval(ctx, """
+               (async () => await host_async(41))()
+               """)
+    end
+
+    test "async host capabilities run concurrently and resolve out of order" do
+      parent = self()
+
+      owner =
+        spawn_link(fn ->
+          {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+          {:ok, ctx} =
+            QuickjsEx.set_async(ctx, :host_async, fn [value] ->
+              send(parent, {:entered, value, self()})
+
+              receive do
+                {:release, ^value, result} -> result
+              end
+            end)
+
+          send(parent, {:ready, self()})
+
+          result =
+            QuickjsEx.eval(ctx, """
+            (async () => Promise.all([host_async(1), host_async(2)]))()
+            """)
+
+          send(parent, {:result, result})
+        end)
+
+      assert_receive {:ready, ^owner}, 1_000
+      assert_receive {:entered, 1, first_task}, 1_000
+      assert_receive {:entered, 2, second_task}, 1_000
+      assert first_task != second_task
+
+      send(second_task, {:release, 2, 20})
+      send(first_task, {:release, 1, 10})
+
+      assert_receive {:result, {:ok, [10, 20]}}, 1_000
+    end
+
+    test "async host callback errors reject as js_error" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+      {:ok, ctx} = QuickjsEx.set_async(ctx, :fail_async, fn [] -> {:error, "async rejected"} end)
+
+      assert {:error, {:js_error, message}} =
+               QuickjsEx.eval(ctx, """
+               (async () => await fail_async())()
+               """)
+
+      assert message =~ "async rejected"
+    end
+
+    test "eval timeout pauses while waiting for async host resolution" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      {:ok, ctx} =
+        QuickjsEx.set_async(ctx, :slow_async, fn [] ->
+          Process.sleep(100)
+          42
+        end)
+
+      assert {:ok, 42} =
+               QuickjsEx.eval(
+                 ctx,
+                 """
+                 (async () => await slow_async())()
+                 """,
+                 timeout: 10
+               )
+    end
+
+    test "pending async host promises do not consume dirty CPU schedulers" do
+      dirty_schedulers = :erlang.system_info(:dirty_cpu_schedulers_online)
+      context_count = dirty_schedulers + 2
+      parent = self()
+
+      tasks =
+        for index <- 1..context_count do
+          Task.async(fn ->
+            {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+            {:ok, ctx} =
+              QuickjsEx.set_async(ctx, :slow_async, fn [] ->
+                send(parent, {:entered_async, self()})
+                Process.sleep(500)
+                index
+              end)
+
+            send(parent, {:ready_async, self()})
+
+            receive do
+              :go -> :ok
+            after
+              1_000 -> flunk("context #{index} did not receive start signal")
+            end
+
+            QuickjsEx.eval(ctx, "(async () => await slow_async())()")
+          end)
+        end
+
+      ready_pids =
+        for _ <- 1..context_count do
+          assert_receive {:ready_async, pid}, 5_000
+          pid
+        end
+
+      responsiveness_task =
+        Task.async(fn ->
+          Enum.reduce(1..50_000, 0, &+/2)
+        end)
+
+      start = System.monotonic_time(:millisecond)
+      Enum.each(ready_pids, &send(&1, :go))
+
+      for _ <- 1..context_count do
+        assert_receive {:entered_async, _pid}, 5_000
+      end
+
+      assert Task.await(responsiveness_task, 100) == div(50_000 * 50_001, 2)
+      assert Enum.map(tasks, &Task.await(&1, 2_000)) |> Enum.all?(&match?({:ok, _}, &1))
+
+      elapsed_ms = System.monotonic_time(:millisecond) - start
+      assert elapsed_ms < 850
+    end
+
+    test "owner death while waiting on async host promise tears down retained context" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+          {:ok, ctx} =
+            QuickjsEx.set_async(ctx, :park_async, fn [] ->
+              send(parent, {:entered_async_teardown, self()})
+
+              receive do
+                :release -> 41
+              end
+            end)
+
+          send(parent, {:ctx_async_teardown, self(), ctx})
+
+          send(
+            parent,
+            {:eval_result, self(), QuickjsEx.eval(ctx, "(async () => await park_async())()")}
+          )
+        end)
+
+      monitor_ref = Process.monitor(owner)
+      assert_receive {:ctx_async_teardown, ^owner, ctx}, 1_000
+      assert_receive {:entered_async_teardown, async_task}, 1_000
+
+      assert_vm_responsive()
+      Process.exit(owner, :kill)
+
+      assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :killed}, 1_000
+      assert_context_eventually_stopped(ctx)
+      Process.exit(async_task, :kill)
+      assert_fresh_context_eval_with_callback()
+    end
+
+    test "module eval imports source from Elixir loader" do
+      {:ok, ctx} = QuickjsEx.new()
+
+      {:ok, ctx} =
+        QuickjsEx.set_module_loader(ctx, fn
+          "math" -> {:ok, "export let value = 41;"}
+        end)
+
+      assert {:ok, nil} =
+               QuickjsEx.eval(
+                 ctx,
+                 """
+                 import { value } from "math";
+                 globalThis.moduleValue = value + 1;
+                 """,
+                 type: :module
+               )
+
+      assert {:ok, 42} = QuickjsEx.get(ctx, :moduleValue)
+    end
+
+    test "module import without loader returns module_load_error" do
+      {:ok, ctx} = QuickjsEx.new()
+
+      assert {:error, :module_load_error} =
+               QuickjsEx.eval(
+                 ctx,
+                 """
+                 import "missing";
+                 """,
+                 type: :module
+               )
+    end
+
+    test "module loader errors return module_load_error" do
+      {:ok, ctx} = QuickjsEx.new()
+      {:ok, ctx} = QuickjsEx.set_module_loader(ctx, fn "missing" -> {:error, "not found"} end)
+
+      assert {:error, :module_load_error} =
+               QuickjsEx.eval(
+                 ctx,
+                 """
+                 import "missing";
+                 """,
+                 type: :module
+               )
+    end
+
+    test "module top-level await settles through the event loop" do
+      {:ok, ctx} = QuickjsEx.new()
+
+      {:ok, ctx} =
+        QuickjsEx.set_module_loader(ctx, fn
+          "async_value" -> {:ok, "export let value = await Promise.resolve(41) + 1;"}
+        end)
+
+      assert {:ok, nil} =
+               QuickjsEx.eval(
+                 ctx,
+                 """
+                 import { value } from "async_value";
+                 globalThis.moduleAsyncValue = value;
+                 """,
+                 type: :module
+               )
+
+      assert {:ok, 42} = QuickjsEx.get(ctx, :moduleAsyncValue)
+    end
+
+    test "dynamic import uses the Elixir module loader" do
+      {:ok, ctx} = QuickjsEx.new()
+
+      {:ok, ctx} =
+        QuickjsEx.set_module_loader(ctx, fn
+          "dynamic_value" -> {:ok, "export let value = 42;"}
+        end)
+
+      assert {:ok, 42} =
+               QuickjsEx.eval(ctx, """
+               (async () => {
+                 const module = await import("dynamic_value");
+                 return module.value;
+               })()
+               """)
     end
 
     test "function serialization returns js_error" do
