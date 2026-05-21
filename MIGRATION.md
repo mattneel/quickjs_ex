@@ -15,6 +15,7 @@
 | Callback execution | Trampoline/replay semantics | Direct linear callback execution (no replay trampoline) |
 | Promise/async eval | Promise results rejected as `:async_not_supported` | QuickJS jobs are drained; settled promises return values, rejections return `{:js_error, msg}`, and permanently pending roots return `:unsettled_promise` |
 | ES modules | Not supported | `eval(..., type: :module)` and `set_module_loader/2`; failed imports return `:module_load_error` |
+| Stateful runtime wrapper | Application-owned process patterns | `QuickjsEx.Server` owns one context in a GenServer with queued evals and stateful async callbacks |
 | Context ownership | Implicit/shared assumptions were common | Owner-bound contexts; non-owner calls return `{:error, :not_owner}` |
 | JavaScript dialect | Older QuickJS baseline | QuickJS-NG with ES2023 support |
 
@@ -93,7 +94,28 @@ end)
 QuickjsEx.eval(ctx, ~s/import { debug } from "settings";, type: :module)
 ```
 
-10. Run parity and security verification suites before rollout:
+10. Use `QuickjsEx.Server` when the runtime should own durable Elixir state:
+
+```elixir
+defmodule CounterRuntime do
+  use QuickjsEx.Server, callbacks: [:increment]
+
+  @impl QuickjsEx.Server
+  def init(_opts), do: {:ok, %{count: 0}}
+
+  @impl QuickjsEx.Server
+  def handle_js_call("increment", [by], state) do
+    next = state.count + by
+    {:reply, next, %{state | count: next}}
+  end
+end
+```
+
+Server eval calls are queued through a GenServer and callbacks can defer promise
+resolution with `QuickjsEx.Server.resolve/2` or `reject/2`. See
+[docs/server.md](docs/server.md) for the full Server guide.
+
+11. Run parity and security verification suites before rollout:
 
 ```bash
 mix test test/quickjs_ex_test.exs
@@ -109,5 +131,6 @@ Both suites should pass without relaxing assertions: parity checks confirm migra
 - Typed, pattern-matchable error categories.
 - First-class promise settlement and async host functions.
 - ES module imports backed by an Elixir loader.
+- A stateful GenServer runtime wrapper for queued evals and async callbacks.
 - Safer default memory budget (4 MB).
 - Actively maintained engine/runtime integration.

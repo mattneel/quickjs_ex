@@ -12,7 +12,7 @@ defmodule QuickjsEx.MixProject do
       source_url: "https://github.com/your-org/quickjs_ex",
       docs: [
         main: "readme",
-        extras: ["README.md", "MIGRATION.md", "docs/vendor_quickjs.md"],
+        extras: ["README.md", "MIGRATION.md", "docs/server.md", "docs/vendor_quickjs.md"],
         source_ref: "v#{@version}"
       ],
       compilers: Mix.compilers(),

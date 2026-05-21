@@ -112,6 +112,37 @@ ctx = QuickjsEx.put_private(ctx, :prefix, "Hello")
 {:ok, "Hello, Ada!"} = QuickjsEx.eval(ctx, "greet('Ada')")
 ```
 
+### 8) `QuickjsEx.Server` for stateful JavaScript runtimes
+
+```elixir
+defmodule CounterRuntime do
+  use QuickjsEx.Server, callbacks: [:increment, :count]
+
+  @impl QuickjsEx.Server
+  def init(_opts), do: {:ok, %{count: 0}}
+
+  @impl QuickjsEx.Server
+  def handle_js_call("increment", [by], state) do
+    next = state.count + by
+    {:reply, next, %{state | count: next}}
+  end
+
+  def handle_js_call("count", [], state), do: {:reply, state.count, state}
+end
+
+{:ok, server} = CounterRuntime.start_link([])
+{:ok, 2} = QuickjsEx.Server.eval_sync(server, "increment(2)")
+{:ok, 2} = QuickjsEx.Server.eval_sync(server, "count()")
+```
+
+`QuickjsEx.Server` owns one context in a GenServer, queues evals, and handles
+JavaScript callback requests in the Server mailbox. Server callbacks are
+promise-capable from JavaScript and can return `{:reply, value, state}` or defer
+with `{:noreply, state}` plus `QuickjsEx.Server.resolve/2` or `reject/2`.
+
+See [docs/server.md](docs/server.md) for deferred callbacks, `eval_async/3`,
+module loaders, API state namespaces, and gas accounting.
+
 ## `new/1` options
 
 | Option | Type | Default | Description |
