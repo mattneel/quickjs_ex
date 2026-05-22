@@ -942,7 +942,7 @@ defmodule QuickjsExTest do
 
   describe "runtime bootstrap" do
     test "new returns an error when bootstrap fails" do
-      assert {:error, _reason} = QuickjsEx.new(memory_limit: 110_000)
+      assert {:error, {:js_error, _message}} = QuickjsEx.new(stack_limit: 512)
     end
 
     test "bootstrap installs console.log on normal contexts" do
