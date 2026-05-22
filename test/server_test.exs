@@ -118,6 +118,16 @@ defmodule QuickjsEx.ServerTest do
     def handle_js_call("get", [], state), do: {:reply, state.count, state}
   end
 
+  defmodule StatefulDefjsApi do
+    use QuickjsEx.API, scope: "stateful"
+
+    defjs get(), state do
+      state
+    end
+
+    def handle_js_call("get", [], state), do: {:reply, state.value, state}
+  end
+
   defp start_harness(opts \\ []) do
     {id, opts} = Keyword.pop(opts, :id, Harness)
 
@@ -134,6 +144,24 @@ defmodule QuickjsEx.ServerTest do
       {:ok, server} = start_harness()
 
       assert {:ok, 42} = QuickjsEx.Server.eval_sync(server, "40 + 2")
+    end
+
+    test "server start timeout becomes the default eval timeout" do
+      {:ok, server} = start_harness(timeout: 10)
+
+      assert {:error, :timeout} =
+               QuickjsEx.Server.eval_sync(server, "while(true) {}", call_timeout: 1_000)
+
+      assert {:ok, 42} = QuickjsEx.Server.eval_sync(server, "42")
+    end
+
+    test "caller timeout bounds eval when server timeout is omitted" do
+      {:ok, server} = start_harness()
+
+      assert {:error, :timeout} =
+               QuickjsEx.Server.eval_sync(server, "while(true) {}", call_timeout: 500)
+
+      assert {:ok, 42} = QuickjsEx.Server.eval_sync(server, "40 + 2", call_timeout: 1_000)
     end
 
     test "eval_async sends a tagged result to the requester" do
@@ -203,6 +231,114 @@ defmodule QuickjsEx.ServerTest do
 
       send(worker, {:resolve, 10})
       assert {:ok, 10} = Task.await(first, 1_000)
+    end
+
+    test "eval_sync can reject instead of queueing while the context is busy" do
+      {:ok, server} = start_harness()
+
+      first =
+        Task.async(fn ->
+          QuickjsEx.Server.eval_sync(server, "(async () => await later(10))()")
+        end)
+
+      assert_receive {:later_started, worker, 10}, 1_000
+
+      assert {:error, :context_busy} =
+               QuickjsEx.Server.eval_sync(server, "40 + 2",
+                 on_busy: :error,
+                 call_timeout: 250
+               )
+
+      send(worker, {:resolve, 10})
+      assert {:ok, 10} = Task.await(first, 1_000)
+    end
+
+    test "queued work from a dead sync caller is dropped before later work starts" do
+      {:ok, server} = start_harness()
+
+      first =
+        Task.async(fn ->
+          QuickjsEx.Server.eval_sync(server, "(async () => await later(1))()")
+        end)
+
+      assert_receive {:later_started, worker, 1}, 1_000
+
+      queued =
+        spawn(fn ->
+          QuickjsEx.Server.eval_sync(server, "while(true) {}", call_timeout: :infinity)
+        end)
+
+      assert_queue_size(server, 1)
+      Process.exit(queued, :kill)
+
+      survivor =
+        Task.async(fn ->
+          QuickjsEx.Server.eval_sync(server, "40 + 2", call_timeout: 1_000)
+        end)
+
+      assert_queue_size(server, 1)
+      send(worker, {:resolve, 1})
+
+      assert {:ok, 1} = Task.await(first, 1_000)
+      assert {:ok, 42} = Task.await(survivor, 1_000)
+    end
+
+    test "active eval parked on a callback is released when sync caller dies" do
+      {:ok, server} = start_harness()
+      parent = self()
+
+      caller =
+        spawn(fn ->
+          result = QuickjsEx.Server.eval_sync(server, "(async () => await later(5))()", :infinity)
+          send(parent, {:dead_caller_result, result})
+        end)
+
+      assert_receive {:later_started, worker, 5}, 1_000
+      Process.exit(caller, :kill)
+
+      assert {:ok, 42} = QuickjsEx.Server.eval_sync(server, "40 + 2", call_timeout: 1_000)
+      refute_receive {:dead_caller_result, _result}, 50
+      Process.exit(worker, :kill)
+    end
+
+    test "active eval timeout at caller still leaves server usable after callback resolves" do
+      {:ok, server} = start_harness()
+
+      caller =
+        Task.async(fn ->
+          catch_exit(
+            QuickjsEx.Server.eval_sync(server, "(async () => await later(6))()", call_timeout: 10)
+          )
+        end)
+
+      assert_receive {:later_started, worker, 6}, 1_000
+      assert {:timeout, {GenServer, :call, _args}} = Task.await(caller, 1_000)
+
+      send(worker, {:resolve, 6})
+      assert {:ok, 42} = QuickjsEx.Server.eval_sync(server, "40 + 2", call_timeout: 1_000)
+    end
+
+    test "queue size limit rejects excess work and leaves the server usable" do
+      {:ok, server} = start_harness(max_queue_size: 1)
+
+      first =
+        Task.async(fn ->
+          QuickjsEx.Server.eval_sync(server, "(async () => await later(2))()")
+        end)
+
+      assert_receive {:later_started, worker, 2}, 1_000
+
+      queued = Task.async(fn -> QuickjsEx.Server.eval_sync(server, "21 * 2") end)
+      assert_queue_size(server, 1)
+
+      assert {:error, :context_busy} =
+               QuickjsEx.Server.eval_sync(server, "40 + 2", call_timeout: 250)
+
+      send(worker, {:resolve, 2})
+
+      assert {:ok, 2} = Task.await(first, 1_000)
+      assert {:ok, 42} = Task.await(queued, 1_000)
+      assert {:ok, 42} = QuickjsEx.Server.eval_sync(server, "42")
     end
 
     test "gas reports runtime accounting through the server queue" do
@@ -334,5 +470,34 @@ defmodule QuickjsEx.ServerTest do
                })()
                """)
     end
+
+    test "server APIs preserve stateful defjs metadata through handle_js_call state slices" do
+      {:ok, server} =
+        start_harness(
+          id: StatefulDefjsApi,
+          apis: [{StatefulDefjsApi, %{value: 41}}]
+        )
+
+      assert {:ok, 41} =
+               QuickjsEx.Server.eval_sync(server, """
+               (async () => await stateful.get())()
+               """)
+    end
+  end
+
+  defp assert_queue_size(server, expected) do
+    result =
+      Enum.reduce_while(1..20, nil, fn _, _ ->
+        case :sys.get_state(server, 1_000) do
+          %QuickjsEx.Server.State{queue_size: ^expected} = state ->
+            {:halt, state}
+
+          state ->
+            Process.sleep(10)
+            {:cont, state}
+        end
+      end)
+
+    assert %QuickjsEx.Server.State{queue_size: ^expected} = result
   end
 end

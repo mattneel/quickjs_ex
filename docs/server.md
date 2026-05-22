@@ -19,7 +19,11 @@ or `handle_cast/2`, and processes these runtime messages in its mailbox:
 
 This means the Server loop stays available while JavaScript is parked on a host
 callback. Resolutions, rejections, module loads, gas reads, and queued evals all
-move through the same serialized Server state.
+move through the same serialized Server state. Queued sync calls are monitored
+and dropped if their caller process dies before they start. If the active eval is
+parked on deferred Server callbacks and its sync caller exits, those pending
+callbacks are rejected; CPU-bound active evals continue until their effective
+JavaScript timeout.
 
 ## Defining a server
 
@@ -102,9 +106,14 @@ settles:
 
 Useful options:
 
-- `:timeout` - JavaScript execution timeout in milliseconds.
-- `:call_timeout` - caller wait timeout for `GenServer.call/3`.
+- `:timeout` - JavaScript execution timeout in milliseconds; omitted evals use
+  the context default configured when the Server starts. The Server default is
+  `5_000`; pass `timeout: 0` only when unbounded JS execution is intentional.
+- `:call_timeout` - caller wait timeout for `GenServer.call/3`. For sync evals
+  without an explicit `:timeout`, finite call timeouts also cap the JS timeout so
+  CPU-bound work is interrupted before the caller exits.
 - `:type` - `:script` or `:module`.
+- `:on_busy` - `:queue` (default) or `:error`.
 
 `eval_async/3` returns a ref immediately and sends the result to the requester:
 
@@ -117,13 +126,21 @@ receive do
 end
 ```
 
-Eval commands are serialized. `eval_sync/3` always queues behind the active eval.
-`eval_async/3` queues by default; pass `on_busy: :error` to receive
-`{:error, :context_busy}` instead:
+Eval commands are serialized. `eval_sync/3` and `eval_async/3` queue behind the
+active eval by default. Pass `on_busy: :error` to receive
+`{:error, :context_busy}` instead. The Server also has a bounded queue,
+configured by `:max_queue_size` at startup and defaulting to 64; excess work
+returns `{:error, :context_busy}`.
 
 ```elixir
 {:ok, ref} = QuickjsEx.Server.eval_async(server, "work()", on_busy: :error)
 ```
+
+Sync callers are monitored. Queued work from dead callers is dropped. If the
+active eval is waiting on deferred Server callbacks and the original sync caller
+exits, pending callback refs are rejected with `"eval caller unavailable"` so the
+Server can start the next eval. CPU-bound active evals are bounded by the
+effective eval timeout unless you explicitly pass `timeout: 0`.
 
 ## Module loader
 
@@ -148,7 +165,10 @@ imports:
   """)
 ```
 
-Loader failures normalize to `{:error, :module_load_error}`.
+Loader failures normalize to `{:error, :module_load_error}`. The loader receives
+JavaScript-controlled specifiers, so deny by default and only serve known module
+names or normalized allowlisted paths. Avoid raw `File.read/1`, HTTP fetching,
+or package resolution from untrusted specifiers.
 
 ## Stateful API modules
 

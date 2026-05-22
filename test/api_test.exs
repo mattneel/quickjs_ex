@@ -118,6 +118,26 @@ defmodule QuickjsEx.APITest do
     end
   end
 
+  defmodule InvalidInstallReturnAPI do
+    use QuickjsEx.API
+
+    defjs(noop, do: :ok)
+
+    @impl QuickjsEx.API
+    def install(_ctx, _scope, _data), do: :not_a_valid_install_result
+  end
+
+  defmodule ThrowingInstallCodeAPI do
+    use QuickjsEx.API
+
+    defjs(noop, do: :ok)
+
+    @impl QuickjsEx.API
+    def install(_ctx, _scope, _data) do
+      "throw new Error('install boom');"
+    end
+  end
+
   defmodule RuntimeExceptionAPI do
     use QuickjsEx.API, scope: "safe"
 
@@ -207,36 +227,35 @@ defmodule QuickjsEx.APITest do
   # ============================================================================
 
   describe "state access" do
-    test "read state from defjs function" do
+    test "direct load_api rejects stateful defjs functions" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
       ctx = QuickjsEx.set!(ctx, :mykey, "myvalue")
-      {:ok, ctx} = QuickjsEx.load_api(ctx, StateAccessAPI)
 
-      assert {:error, {:callback_error, "get_config", _}} =
-               QuickjsEx.eval(ctx, ~s|get_config("mykey")|)
+      assert {:error, {:invalid_api_module, message}} =
+               QuickjsEx.load_api(ctx, StateAccessAPI)
+
+      assert message =~ "stateful defjs"
+      assert message =~ "QuickjsEx.Server"
     end
 
-    test "write state from defjs function" do
+    test "direct load_api rejects stateful write callbacks before runtime" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
-      {:ok, ctx} = QuickjsEx.load_api(ctx, StateAccessAPI)
 
-      assert {:error, {:callback_error, "set_config", _}} =
-               QuickjsEx.eval(ctx, ~s|set_config("counter", 42)|)
+      assert {:error, {:invalid_api_module, message}} =
+               QuickjsEx.load_api(ctx, StateAccessAPI)
+
+      assert message =~ "get_config"
+      assert message =~ "set_config"
     end
 
-    test "read and modify state" do
+    test "direct load_api rejects stateful read-modify callbacks before runtime" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
       ctx = QuickjsEx.set!(ctx, :counter, 0)
-      {:ok, ctx} = QuickjsEx.load_api(ctx, StateAccessAPI)
 
-      code = """
-      var a = get_and_increment("counter");
-      var b = get_and_increment("counter");
-      var c = get_and_increment("counter");
-      [a, b, c]
-      """
+      assert {:error, {:invalid_api_module, message}} =
+               QuickjsEx.load_api(ctx, StateAccessAPI)
 
-      assert {:error, {:callback_error, _, _}} = QuickjsEx.eval(ctx, code)
+      assert message =~ "get_and_increment"
     end
   end
 
@@ -277,15 +296,11 @@ defmodule QuickjsEx.APITest do
 
     test "variadic with state" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
-      {:ok, ctx} = QuickjsEx.load_api(ctx, VariadicWithStateAPI)
 
-      code = """
-      var first = sum_and_store(1, 2, 3);
-      var second = sum_and_store(10, 20);
-      [first, second]
-      """
+      assert {:error, {:invalid_api_module, message}} =
+               QuickjsEx.load_api(ctx, VariadicWithStateAPI)
 
-      assert {:error, {:callback_error, "sum_and_store", _}} = QuickjsEx.eval(ctx, code)
+      assert message =~ "sum_and_store"
     end
   end
 
@@ -359,6 +374,24 @@ defmodule QuickjsEx.APITest do
 
       {:ok, result} = QuickjsEx.eval(ctx, "get_constant()")
       assert result == "from elixir"
+    end
+
+    test "invalid install return is reported as an API module contract error" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:error, {:invalid_api_module, message}} =
+               QuickjsEx.load_api(ctx, InvalidInstallReturnAPI)
+
+      assert message =~ "install/3 must return"
+    end
+
+    test "runtime failures during install preserve the runtime error" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:error, {:js_error, message}} =
+               QuickjsEx.load_api(ctx, ThrowingInstallCodeAPI)
+
+      assert message =~ "install boom"
     end
   end
 

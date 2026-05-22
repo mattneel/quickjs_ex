@@ -37,9 +37,12 @@ defmodule QuickjsEx.Server do
   `resolve(ref, value, transition_fun)` so the transition is applied against the
   live state at completion time, not against a stale snapshot captured by a Task.
 
-  Runtime execution is serialized explicitly. `eval_sync/3` calls are queued.
-  `eval_async/3` queues by default and can return `:context_busy` to the requester
-  with `on_busy: :error`.
+  Runtime execution is serialized explicitly. Calls queue behind the active eval
+  up to `:max_queue_size` (default: 64). Both `eval_sync/3` and `eval_async/3`
+  can return `:context_busy` with `on_busy: :error`; excess queued work also
+  returns `:context_busy`. Queued sync work from dead callers is dropped. Server
+  evals use a finite JavaScript timeout by default; pass `timeout: 0` only when
+  unbounded JS execution is intentional.
   """
 
   use GenServer
@@ -49,6 +52,9 @@ defmodule QuickjsEx.Server do
 
   @current_ref_key {__MODULE__, :current_ref}
   @result_message :quickjs_ex_server_result
+  @default_max_queue_size 64
+  @default_eval_timeout 5_000
+  @call_timeout_eval_grace_ms 250
 
   @callback init(term()) :: {:ok, term()} | {:ok, term(), keyword()}
   @callback handle_js_call(String.t(), list(), term()) ::
@@ -83,6 +89,8 @@ defmodule QuickjsEx.Server do
       api_states: %{},
       active: nil,
       queue: :queue.new(),
+      queue_size: 0,
+      max_queue_size: 64,
       pending_callbacks: %{}
     ]
   end
@@ -122,8 +130,8 @@ defmodule QuickjsEx.Server do
   is selected dynamically.
 
   `init_arg` is passed to the callback module's `init/1`. Keyword values for
-  `:memory_limit`, `:stack_limit`, `:timeout`, `:callbacks`, `:apis`, and
-  `:module_loader` are used as Server configuration.
+  `:memory_limit`, `:stack_limit`, `:timeout`, `:max_queue_size`, `:callbacks`,
+  `:apis`, and `:module_loader` are used as Server configuration.
   """
   @spec start_link(module(), term(), GenServer.options()) :: GenServer.on_start()
   def start_link(callback_module, init_arg \\ [], genserver_opts \\ [])
@@ -141,9 +149,12 @@ defmodule QuickjsEx.Server do
 
   Options:
 
-  - `:timeout` - JavaScript execution timeout in milliseconds.
+  - `:timeout` - JavaScript execution timeout in milliseconds; when omitted,
+    the context default from server startup is used. Server startup defaults this
+    to `5_000`; pass `timeout: 0` to disable it intentionally.
   - `:call_timeout` - `GenServer.call/3` timeout; defaults to `5_000`.
   - `:type` - `:script` or `:module`, matching `QuickjsEx.eval/3`.
+  - `:on_busy` - `:queue` (default) or `:error`.
 
   Returns the same normalized result shape as `QuickjsEx.eval/3`.
   """
@@ -152,7 +163,7 @@ defmodule QuickjsEx.Server do
 
   def eval_sync(server, source, timeout)
       when is_binary(source) and (is_integer(timeout) or timeout == :infinity) do
-    GenServer.call(server, {:eval_sync, source, []}, timeout)
+    GenServer.call(server, {:eval_sync, source, [call_timeout: timeout]}, timeout)
   end
 
   def eval_sync(server, source, opts) when is_binary(source) and is_list(opts) do
@@ -253,6 +264,7 @@ defmodule QuickjsEx.Server do
   def init({callback_module, init_arg}) do
     with {:ok, root_state, server_opts} <- init_callback_module(callback_module, init_arg),
          opts <- merged_server_options(callback_module, init_arg, server_opts),
+         {:ok, max_queue_size} <- max_queue_size_option(opts),
          {:ok, ctx} <- QuickjsEx.new(context_options(init_arg, opts)),
          {:ok, ctx, registry, api_states} <- install_callbacks(ctx, callback_module, opts) do
       state = %State{
@@ -261,7 +273,8 @@ defmodule QuickjsEx.Server do
         root_state: root_state,
         module_loader: Keyword.get(opts, :module_loader),
         registry: registry,
-        api_states: api_states
+        api_states: api_states,
+        max_queue_size: max_queue_size
       }
 
       {:ok, state}
@@ -272,12 +285,20 @@ defmodule QuickjsEx.Server do
 
   @impl GenServer
   def handle_call({:eval_sync, source, opts}, from, state) do
-    request = %{kind: :sync, from: from, source: source, opts: opts}
+    request =
+      from
+      |> sync_request()
+      |> Map.merge(%{source: source, opts: opts})
+
     {:noreply, enqueue_eval(request, state)}
   end
 
   def handle_call(:gas, from, state) do
-    request = %{kind: :sync, op: :gas, from: from}
+    request =
+      from
+      |> sync_request()
+      |> Map.merge(%{op: :gas, opts: []})
+
     {:noreply, enqueue_eval(request, state)}
   end
 
@@ -368,6 +389,10 @@ defmodule QuickjsEx.Server do
     {:noreply, state}
   end
 
+  def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+    {:noreply, drop_or_mark_dead_sync_request(state, monitor_ref)}
+  end
+
   def handle_info(_message, state), do: {:noreply, state}
 
   defp init_callback_module(callback_module, init_arg) do
@@ -405,7 +430,18 @@ defmodule QuickjsEx.Server do
         :error -> acc
       end
     end)
+    |> Keyword.put_new(:timeout, @default_eval_timeout)
     |> Keyword.merge(Keyword.take(init_opts, [:memory_limit, :stack_limit, :timeout]))
+  end
+
+  defp max_queue_size_option(opts) do
+    case Keyword.get(opts, :max_queue_size, @default_max_queue_size) do
+      value when is_integer(value) and value >= 0 ->
+        {:ok, value}
+
+      _other ->
+        {:error, {:invalid_option, :max_queue_size, "must be a non-negative integer"}}
+    end
   end
 
   defp install_callbacks(ctx, callback_module, opts) do
@@ -493,18 +529,35 @@ defmodule QuickjsEx.Server do
     end
   end
 
+  defp sync_request(from) do
+    %{kind: :sync, from: from, monitor_ref: monitor_caller(from), caller_down?: false}
+  end
+
+  defp monitor_caller({pid, _tag}) when is_pid(pid), do: Process.monitor(pid)
+
   defp enqueue_eval(request, %State{active: nil} = state) do
     start_eval(request, state)
   end
 
   defp enqueue_eval(request, state) do
-    %{state | queue: :queue.in(request, state.queue)}
+    cond do
+      request_on_busy_error?(request) ->
+        deliver_eval_result(request, {:error, :context_busy})
+        state
+
+      state.queue_size >= state.max_queue_size ->
+        deliver_eval_result(request, {:error, :context_busy})
+        state
+
+      true ->
+        %{state | queue: :queue.in(request, state.queue), queue_size: state.queue_size + 1}
+    end
   end
 
   defp maybe_start_next(%State{active: nil} = state) do
-    case :queue.out(state.queue) do
-      {{:value, request}, queue} -> start_eval(request, %{state | queue: queue})
-      {:empty, _queue} -> state
+    case pop_next_live_request(state) do
+      {:ok, request, state} -> start_eval(request, state)
+      :empty -> state
     end
   end
 
@@ -532,10 +585,38 @@ defmodule QuickjsEx.Server do
   end
 
   defp dispatch_request(request, %Context{} = ctx, request_ref) do
-    timeout = Keyword.get(request.opts, :timeout, 0)
+    timeout = eval_timeout(request.opts, ctx.default_timeout)
     eval_as_module? = Keyword.get(request.opts, :type, :script) == :module
 
     NIF.nif_eval(ctx.ref, request_ref, request.source, timeout, eval_as_module?)
+  end
+
+  defp eval_timeout(opts, default_timeout) do
+    case Keyword.fetch(opts, :timeout) do
+      {:ok, timeout} -> timeout
+      :error -> default_eval_timeout(opts, default_timeout)
+    end
+  end
+
+  defp default_eval_timeout(_opts, 0), do: 0
+
+  defp default_eval_timeout(opts, default_timeout) do
+    case Keyword.get(opts, :call_timeout) do
+      call_timeout when is_integer(call_timeout) and call_timeout >= 0 ->
+        min(default_timeout, eval_timeout_before_call_timeout(call_timeout))
+
+      _other ->
+        default_timeout
+    end
+  end
+
+  defp eval_timeout_before_call_timeout(call_timeout)
+       when call_timeout <= @call_timeout_eval_grace_ms do
+    call_timeout
+  end
+
+  defp eval_timeout_before_call_timeout(call_timeout) do
+    call_timeout - @call_timeout_eval_grace_ms
   end
 
   defp clear_active_eval(state) do
@@ -549,10 +630,129 @@ defmodule QuickjsEx.Server do
     %{state | active: nil, pending_callbacks: pending_callbacks}
   end
 
-  defp deliver_eval_result(%{kind: :sync, from: from}, result), do: GenServer.reply(from, result)
+  defp deliver_eval_result(%{kind: :sync, caller_down?: true} = request, _result) do
+    demonitor_request(request)
+    :ok
+  end
+
+  defp deliver_eval_result(%{kind: :sync, from: from} = request, result) do
+    demonitor_request(request)
+    GenServer.reply(from, result)
+  end
 
   defp deliver_eval_result(%{kind: :async, requester: requester, result_ref: ref}, result) do
     send(requester, {@result_message, ref, result})
+  end
+
+  defp demonitor_request(%{monitor_ref: monitor_ref}) when is_reference(monitor_ref) do
+    Process.demonitor(monitor_ref, [:flush])
+  end
+
+  defp demonitor_request(_request), do: :ok
+
+  defp request_on_busy_error?(%{opts: opts}) do
+    Keyword.get(opts, :on_busy) == :error
+  end
+
+  defp request_on_busy_error?(_request), do: false
+
+  defp pop_next_live_request(%State{} = state) do
+    case :queue.out(state.queue) do
+      {{:value, request}, queue} ->
+        state = %{state | queue: queue, queue_size: state.queue_size - 1}
+
+        if request_live?(request) do
+          {:ok, request, state}
+        else
+          demonitor_request(request)
+          pop_next_live_request(state)
+        end
+
+      {:empty, _queue} ->
+        :empty
+    end
+  end
+
+  defp request_live?(%{kind: :sync, caller_down?: true}), do: false
+
+  defp request_live?(%{kind: :sync, from: {pid, _tag}}) when is_pid(pid) do
+    Process.alive?(pid)
+  end
+
+  defp request_live?(_request), do: true
+
+  defp drop_or_mark_dead_sync_request(%State{} = state, monitor_ref) do
+    state
+    |> mark_active_caller_down(monitor_ref)
+    |> drop_queued_sync_request(monitor_ref)
+  end
+
+  defp mark_active_caller_down(
+         %State{active: %{monitor_ref: monitor_ref} = active} = state,
+         monitor_ref
+       ) do
+    state
+    |> reject_pending_callbacks_for_active("eval caller unavailable")
+    |> Map.put(:active, %{active | caller_down?: true})
+  end
+
+  defp mark_active_caller_down(state, _monitor_ref), do: state
+
+  defp drop_queued_sync_request(%State{} = state, monitor_ref) do
+    {kept, dropped_count} =
+      state.queue
+      |> :queue.to_list()
+      |> Enum.reduce({[], 0}, fn
+        %{monitor_ref: ^monitor_ref} = request, {kept, dropped_count} ->
+          demonitor_request(request)
+          {kept, dropped_count + 1}
+
+        request, {kept, dropped_count} ->
+          {[request | kept], dropped_count}
+      end)
+
+    if dropped_count == 0 do
+      state
+    else
+      %{
+        state
+        | queue: kept |> Enum.reverse() |> :queue.from_list(),
+          queue_size: state.queue_size - dropped_count
+      }
+    end
+  end
+
+  defp reject_pending_callbacks_for_active(%State{} = state, reason) do
+    active_ref = state.active.request_ref
+
+    {stale_pending, kept_pending} =
+      Enum.split_with(state.pending_callbacks, fn {_token, pending} ->
+        pending.eval_ref == active_ref
+      end)
+
+    Enum.each(stale_pending, fn {_token, pending} ->
+      _ = NIF.nif_resolve_async(state.ctx.ref, pending.eval_ref, pending.req_id, {:error, reason})
+    end)
+
+    %{state | pending_callbacks: Map.new(kept_pending)}
+  end
+
+  defp handle_async_request(
+         %State{active: %{request_ref: request_ref, caller_down?: true}} = state,
+         request_ref,
+         req_id,
+         _callback_name,
+         _args
+       ) do
+    _ =
+      NIF.nif_resolve_async(
+        state.ctx.ref,
+        request_ref,
+        req_id,
+        {:error, "eval caller unavailable"}
+      )
+
+    state
   end
 
   defp handle_async_request(
@@ -644,7 +844,7 @@ defmodule QuickjsEx.Server do
   defp handle_callback_return(
          state,
          request_ref,
-         _req_id,
+         req_id,
          callback_name,
          ref,
          target,
@@ -654,6 +854,7 @@ defmodule QuickjsEx.Server do
 
     pending = %{
       eval_ref: request_ref,
+      req_id: req_id,
       callback_name: callback_name,
       target: target
     }

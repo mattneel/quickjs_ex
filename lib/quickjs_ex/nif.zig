@@ -12,6 +12,10 @@ const EvalFlags = zig_quickjs_ng.EvalFlags;
 const c = zig_quickjs_ng.c;
 
 const MAX_MARSHAL_DEPTH: u32 = 100;
+const MAX_RESULT_ARRAY_LENGTH: usize = 10_000;
+const MAX_RESULT_OBJECT_PROPERTIES: usize = 10_000;
+const MAX_RESULT_NODE_COUNT: usize = 50_000;
+const MAX_PENDING_ASYNC_CALLBACKS: usize = 64;
 const INTERRUPT_GAS_QUANTUM: u64 = 10_000;
 const CALLBACK_OWNER_CHECK_NS: u64 = 100 * std.time.ns_per_ms;
 const CONTEXT_THREAD_MIN_STACK_BYTES: u64 = 2 * 1024 * 1024;
@@ -88,6 +92,7 @@ pub const JsContext = struct {
     callback_error_env: beam.env,
     callback_error: ?beam.term,
     async_entries_head_ptr: usize,
+    async_entries_count: usize,
     async_resolution_head_ptr: usize,
     async_resolution_tail_ptr: usize,
     module_load_error: bool,
@@ -135,6 +140,92 @@ fn async_resolution_raw(resolution: ?*AsyncResolution) usize {
     return if (resolution) |value| @intFromPtr(value) else 0;
 }
 
+const ActiveCommandSnapshot = struct {
+    caller_pid: beam.pid,
+    ref_term: beam.term,
+};
+
+fn load_flag(flag: *const bool) bool {
+    return @atomicLoad(bool, flag, .seq_cst);
+}
+
+fn store_flag(flag: *bool, value: bool) void {
+    @atomicStore(bool, flag, value, .seq_cst);
+}
+
+fn context_is_poisoned(ctx_res: *JsContext) bool {
+    return load_flag(&ctx_res.poisoned);
+}
+
+fn mark_context_poisoned(ctx_res: *JsContext) void {
+    store_flag(&ctx_res.poisoned, true);
+}
+
+fn context_is_shutting_down(ctx_res: *JsContext) bool {
+    return load_flag(&ctx_res.shutting_down);
+}
+
+fn mark_context_shutting_down(ctx_res: *JsContext) void {
+    store_flag(&ctx_res.shutting_down, true);
+}
+
+fn active_command_snapshot(ctx_res: *JsContext, env: beam.env) ?ActiveCommandSnapshot {
+    ctx_res.callback_mutex.lock();
+    defer ctx_res.callback_mutex.unlock();
+
+    if (!ctx_res.has_active_command) return null;
+
+    return .{
+        .caller_pid = ctx_res.active_caller_pid,
+        .ref_term = .{ .v = e.enif_make_copy(env, ctx_res.active_ref_term.v) },
+    };
+}
+
+fn active_request_matches_locked(ctx_res: *JsContext, env: beam.env, request_ref: beam.term) bool {
+    if (!ctx_res.has_active_command) return false;
+
+    const active_ref = e.enif_make_copy(env, ctx_res.active_ref_term.v);
+    return e.enif_compare(request_ref.v, active_ref) == 0;
+}
+
+fn async_entry_exists_locked(ctx_res: *JsContext, req_id: u64) bool {
+    var current = async_entry_ptr(ctx_res.async_entries_head_ptr);
+
+    while (current) |entry| {
+        if (entry.req_id == req_id) return true;
+        current = entry.next;
+    }
+
+    return false;
+}
+
+fn active_command_caller(ctx_res: *JsContext) ?beam.pid {
+    ctx_res.callback_mutex.lock();
+    defer ctx_res.callback_mutex.unlock();
+
+    if (!ctx_res.has_active_command) return null;
+    return ctx_res.active_caller_pid;
+}
+
+fn set_active_command(ctx_res: *JsContext, cmd: *Command) void {
+    ctx_res.callback_mutex.lock();
+    defer ctx_res.callback_mutex.unlock();
+
+    ctx_res.active_caller_pid = cmd.caller_pid;
+    ctx_res.active_ref_env = cmd.ref_env;
+    ctx_res.active_ref_term = cmd.ref_term;
+    ctx_res.has_active_command = true;
+}
+
+fn clear_active_command(ctx_res: *JsContext) void {
+    ctx_res.callback_mutex.lock();
+    defer ctx_res.callback_mutex.unlock();
+
+    ctx_res.has_active_command = false;
+    ctx_res.active_ref_env = null;
+    ctx_res.active_ref_term = .{ .v = undefined };
+}
+
 fn process_is_alive(pid: beam.pid) bool {
     const check_env = e.enif_alloc_env() orelse return true;
     defer e.enif_free_env(check_env);
@@ -159,7 +250,7 @@ fn set_callback_abort_locked(ctx_res: *JsContext, reason: CallbackAbortReason) v
 
 fn request_context_shutdown(ctx_res: *JsContext, reason: CallbackAbortReason) void {
     ctx_res.queue_mutex.lock();
-    ctx_res.shutting_down = true;
+    mark_context_shutting_down(ctx_res);
     ctx_res.queue_condvar.signal();
     ctx_res.queue_mutex.unlock();
 
@@ -219,6 +310,7 @@ fn clear_async_entries(ctx_res: *JsContext, ctx: *Context) void {
     ctx_res.callback_mutex.lock();
     var entry = async_entry_ptr(ctx_res.async_entries_head_ptr);
     ctx_res.async_entries_head_ptr = 0;
+    ctx_res.async_entries_count = 0;
     ctx_res.callback_mutex.unlock();
 
     while (entry) |current| {
@@ -246,19 +338,13 @@ fn async_entry_count(ctx_res: *JsContext) usize {
     ctx_res.callback_mutex.lock();
     defer ctx_res.callback_mutex.unlock();
 
-    var count: usize = 0;
-    var entry = async_entry_ptr(ctx_res.async_entries_head_ptr);
-    while (entry) |current| {
-        count += 1;
-        entry = current.next;
-    }
-
-    return count;
+    return ctx_res.async_entries_count;
 }
 
 fn insert_async_entry_locked(ctx_res: *JsContext, entry: *AsyncEntry) void {
     entry.next = async_entry_ptr(ctx_res.async_entries_head_ptr);
     ctx_res.async_entries_head_ptr = async_entry_raw(entry);
+    ctx_res.async_entries_count += 1;
 }
 
 fn remove_async_entry(ctx_res: *JsContext, req_id: u64) ?*AsyncEntry {
@@ -277,6 +363,7 @@ fn remove_async_entry(ctx_res: *JsContext, req_id: u64) ?*AsyncEntry {
             }
 
             entry.next = null;
+            ctx_res.async_entries_count -= 1;
             return entry;
         }
 
@@ -321,12 +408,8 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     const callback_entry = entry orelse return ctx.throwTypeError("callback dispatch missing entry");
     const ctx_res = callback_entry.ctx_res;
 
-    if (ctx_res.poisoned) {
+    if (context_is_poisoned(ctx_res)) {
         return ctx.throwTypeError("javascript context poisoned");
-    }
-
-    if (!ctx_res.has_active_command) {
-        return ctx.throwTypeError("callback invoked without active command");
     }
 
     const msg_env = e.enif_alloc_env() orelse {
@@ -334,13 +417,13 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
     };
     defer e.enif_free_env(msg_env);
 
-    const wait_started = std.time.milliTimestamp();
-
-    const active_ref_copy = beam.term{
-        .v = e.enif_make_copy(msg_env, ctx_res.active_ref_term.v),
+    const snapshot = active_command_snapshot(ctx_res, msg_env) orelse {
+        return ctx.throwTypeError("callback invoked without active command");
     };
 
-    var caller_pid = ctx_res.active_caller_pid;
+    const wait_started = std.time.milliTimestamp();
+
+    var caller_pid = snapshot.caller_pid;
 
     if (!process_is_alive(caller_pid)) {
         request_context_shutdown(ctx_res, .owner_down);
@@ -375,14 +458,14 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
 
     const message = beam.make(.{
         .quickjs_ex_callback,
-        active_ref_copy,
+        snapshot.ref_term,
         req_id,
         callback_entry.name[0..callback_entry.name.len],
         args_list,
     }, .{ .env = msg_env });
 
     if (e.enif_send(null, &caller_pid, msg_env, message.v) == 0) {
-        ctx_res.poisoned = true;
+        mark_context_poisoned(ctx_res);
         return ctx.throwTypeError("callback caller unavailable");
     }
 
@@ -396,7 +479,7 @@ fn callback_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValu
                 continue;
             }
 
-            if (ctx_res.shutting_down) {
+            if (context_is_shutting_down(ctx_res)) {
                 set_callback_abort_locked(ctx_res, .shutdown);
             }
         };
@@ -498,12 +581,8 @@ fn async_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValue, 
     const async_entry_info = entry orelse return ctx.throwTypeError("async dispatch missing entry");
     const ctx_res = async_entry_info.ctx_res;
 
-    if (ctx_res.poisoned) {
+    if (context_is_poisoned(ctx_res)) {
         return ctx.throwTypeError("javascript context poisoned");
-    }
-
-    if (!ctx_res.has_active_command) {
-        return ctx.throwTypeError("async callback invoked without active command");
     }
 
     const msg_env = e.enif_alloc_env() orelse {
@@ -511,11 +590,11 @@ fn async_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValue, 
     };
     defer e.enif_free_env(msg_env);
 
-    const active_ref_copy = beam.term{
-        .v = e.enif_make_copy(msg_env, ctx_res.active_ref_term.v),
+    const snapshot = active_command_snapshot(ctx_res, msg_env) orelse {
+        return ctx.throwTypeError("async callback invoked without active command");
     };
 
-    var caller_pid = ctx_res.active_caller_pid;
+    var caller_pid = snapshot.caller_pid;
 
     if (!process_is_alive(caller_pid)) {
         request_context_shutdown(ctx_res, .owner_down);
@@ -547,13 +626,19 @@ fn async_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValue, 
     };
 
     ctx_res.callback_mutex.lock();
-    if (ctx_res.callback_abort_reason != .none or ctx_res.shutting_down) {
+    if (ctx_res.callback_abort_reason != .none or context_is_shutting_down(ctx_res)) {
         ctx_res.callback_mutex.unlock();
         beam.allocator.destroy(pending);
         promise.value.deinit(ctx);
         promise.resolve.deinit(ctx);
         promise.reject.deinit(ctx);
         return ctx.throwTypeError("javascript context stopped");
+    }
+
+    if (ctx_res.async_entries_count >= MAX_PENDING_ASYNC_CALLBACKS) {
+        ctx_res.callback_mutex.unlock();
+        beam.allocator.destroy(pending);
+        return reject_promise(ctx, promise, "maximum pending async callbacks exceeded");
     }
 
     ctx_res.callback_req_id += 1;
@@ -569,7 +654,7 @@ fn async_dispatch_fn(raw_ctx: ?*Context, _this: Value, argv: []const c.JSValue, 
     const args_list = beam.make(args, .{ .env = msg_env });
     const message = beam.make(.{
         .quickjs_ex_async_request,
-        active_ref_copy,
+        snapshot.ref_term,
         req_id,
         async_entry_info.name[0..async_entry_info.name.len],
         args_list,
@@ -601,15 +686,9 @@ fn module_loader_fn(raw_ctx_res: ?*JsContext, ctx: *Context, module_name: [:0]co
         return null;
     };
 
-    if (ctx_res.poisoned) {
+    if (context_is_poisoned(ctx_res)) {
         ctx_res.module_load_error = true;
         _ = ctx.throwTypeError("javascript context poisoned");
-        return null;
-    }
-
-    if (!ctx_res.has_active_command) {
-        ctx_res.module_load_error = true;
-        _ = ctx.throwTypeError("module loader invoked without active command");
         return null;
     }
 
@@ -621,11 +700,14 @@ fn module_loader_fn(raw_ctx_res: ?*JsContext, ctx: *Context, module_name: [:0]co
     defer e.enif_free_env(msg_env);
 
     const wait_started = std.time.milliTimestamp();
-    const active_ref_copy = beam.term{
-        .v = e.enif_make_copy(msg_env, ctx_res.active_ref_term.v),
+
+    const snapshot = active_command_snapshot(ctx_res, msg_env) orelse {
+        ctx_res.module_load_error = true;
+        _ = ctx.throwTypeError("module loader invoked without active command");
+        return null;
     };
 
-    var caller_pid = ctx_res.active_caller_pid;
+    var caller_pid = snapshot.caller_pid;
 
     if (!process_is_alive(caller_pid)) {
         request_context_shutdown(ctx_res, .owner_down);
@@ -648,7 +730,7 @@ fn module_loader_fn(raw_ctx_res: ?*JsContext, ctx: *Context, module_name: [:0]co
 
     const request_message = beam.make(.{
         .quickjs_ex_module_request,
-        active_ref_copy,
+        snapshot.ref_term,
         req_id,
         module_name[0..module_name.len],
     }, .{ .env = msg_env });
@@ -670,7 +752,7 @@ fn module_loader_fn(raw_ctx_res: ?*JsContext, ctx: *Context, module_name: [:0]co
                 continue;
             }
 
-            if (ctx_res.shutting_down) {
+            if (context_is_shutting_down(ctx_res)) {
                 set_callback_abort_locked(ctx_res, .shutdown);
             }
         };
@@ -860,7 +942,7 @@ fn context_thread_main(raw_ctx: ?*anyopaque) callconv(.c) ?*anyopaque {
         destroy_command(cmd);
 
         ctx_res.queue_mutex.lock();
-        const should_stop = ctx_res.shutting_down;
+        const should_stop = context_is_shutting_down(ctx_res);
         ctx_res.queue_mutex.unlock();
 
         if (should_stop) break;
@@ -889,14 +971,14 @@ fn dequeue_command(ctx_res: *JsContext) ?*Command {
     ctx_res.queue_mutex.lock();
     defer ctx_res.queue_mutex.unlock();
 
-    while (ctx_res.queue_head_ptr == 0 and !ctx_res.shutting_down) {
+    while (ctx_res.queue_head_ptr == 0 and !context_is_shutting_down(ctx_res)) {
         ctx_res.queue_condvar.timedWait(&ctx_res.queue_mutex, CALLBACK_OWNER_CHECK_NS) catch {
             ctx_res.queue_mutex.unlock();
             const owner_alive = process_is_alive(ctx_res.owner_pid);
             ctx_res.queue_mutex.lock();
 
             if (!owner_alive) {
-                ctx_res.shutting_down = true;
+                mark_context_shutting_down(ctx_res);
                 ctx_res.queue_condvar.signal();
             }
         };
@@ -970,9 +1052,7 @@ fn destroy_command(cmd: *Command) void {
 fn mark_command_complete(cmd: *Command) void {
     const ctx_res = command_context_ptr(cmd) orelse return;
 
-    ctx_res.has_active_command = false;
-    ctx_res.active_ref_env = null;
-    ctx_res.active_ref_term = .{ .v = undefined };
+    clear_active_command(ctx_res);
 
     ctx_res.queue_mutex.lock();
     ctx_res.busy = false;
@@ -1073,6 +1153,24 @@ fn reject_async_entry(ctx: *Context, entry: *AsyncEntry, message: []const u8) vo
     defer call_result.deinit(ctx);
 }
 
+fn reject_promise(ctx: *Context, promise: Value.Promise, message: []const u8) Value {
+    const rejection = Value.initStringLen(ctx, message);
+    if (rejection.isException()) {
+        promise.value.deinit(ctx);
+        promise.resolve.deinit(ctx);
+        promise.reject.deinit(ctx);
+        return ctx.throwOutOfMemory();
+    }
+    defer rejection.deinit(ctx);
+
+    const call_result = promise.reject.call(ctx, Value.undefined, &.{rejection});
+    defer call_result.deinit(ctx);
+
+    promise.resolve.deinit(ctx);
+    promise.reject.deinit(ctx);
+    return promise.value;
+}
+
 fn apply_async_resolution(ctx_res: *JsContext, ctx: *Context, resolution: *AsyncResolution) void {
     const entry = remove_async_entry(ctx_res, resolution.req_id) orelse return;
     defer destroy_async_entry(ctx, entry);
@@ -1121,13 +1219,13 @@ fn wait_for_external_resolution(ctx_res: *JsContext, ctx: *Context) ExternalWait
     }
 
     const wait_started = std.time.milliTimestamp();
-    const caller_pid = ctx_res.active_caller_pid;
+    const caller_pid = active_command_caller(ctx_res) orelse std.mem.zeroes(beam.pid);
 
     ctx_res.callback_mutex.lock();
     while (ctx_res.async_resolution_head_ptr == 0 and
         ctx_res.async_entries_head_ptr != 0 and
         ctx_res.callback_abort_reason == .none and
-        !ctx_res.shutting_down)
+        !context_is_shutting_down(ctx_res))
     {
         ctx_res.callback_condvar.timedWait(&ctx_res.callback_mutex, CALLBACK_OWNER_CHECK_NS) catch {
             ctx_res.callback_mutex.unlock();
@@ -1141,13 +1239,13 @@ fn wait_for_external_resolution(ctx_res: *JsContext, ctx: *Context) ExternalWait
                 continue;
             }
 
-            if (ctx_res.shutting_down) {
+            if (context_is_shutting_down(ctx_res)) {
                 set_callback_abort_locked(ctx_res, .shutdown);
             }
         };
     }
 
-    if (ctx_res.callback_abort_reason != .none or ctx_res.shutting_down) {
+    if (ctx_res.callback_abort_reason != .none or context_is_shutting_down(ctx_res)) {
         const abort_reason = ctx_res.callback_abort_reason;
         ctx_res.callback_mutex.unlock();
 
@@ -1267,7 +1365,7 @@ fn send_eval_exception_reply(ctx_res: *JsContext, cmd: *Command, reply_env: beam
     }
 
     if (exception_is_oom(ctx, exc)) {
-        ctx_res.poisoned = true;
+        mark_context_poisoned(ctx_res);
         send_reply(cmd, reply_env, beam.make(.{ .@"error", .oom }, .{ .env = reply_env }));
         return;
     }
@@ -1296,6 +1394,7 @@ fn send_eval_value_reply(ctx_res: *JsContext, cmd: *Command, reply_env: beam.env
     const erl_term = js_to_erl(reply_env, ctx, value, 0) catch |err| {
         const response = switch (err) {
             error.MaxDepth => beam.make(.{ .@"error", .{ .js, "maximum depth exceeded" } }, .{ .env = reply_env }),
+            error.MaxResultSize => beam.make(.{ .@"error", .{ .js, "maximum result size exceeded" } }, .{ .env = reply_env }),
             error.FunctionNotSerializable => beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{ .env = reply_env }),
             error.JSError => current_js_error_with_poison(ctx_res, ctx),
             error.OutOfMemory => poison_internal_error(ctx_res),
@@ -1324,15 +1423,8 @@ fn execute_eval(ctx_res: *JsContext, cmd: *Command) void {
     set_eval_deadline(ctx_res, cmd.timeout_ms);
     defer ctx_res.deadline_ms = 0;
 
-    ctx_res.active_caller_pid = cmd.caller_pid;
-    ctx_res.active_ref_env = cmd.ref_env;
-    ctx_res.active_ref_term = cmd.ref_term;
-    ctx_res.has_active_command = true;
-    defer {
-        ctx_res.has_active_command = false;
-        ctx_res.active_ref_env = null;
-        ctx_res.active_ref_term = .{ .v = undefined };
-    }
+    set_active_command(ctx_res, cmd);
+    defer clear_active_command(ctx_res);
 
     const gas_start = ctx_res.gas_quanta_total;
     defer {
@@ -1416,6 +1508,7 @@ fn execute_get(ctx_res: *JsContext, cmd: *Command) void {
     const erl_term = js_to_erl(reply_env, ctx, prop, 0) catch |err| {
         const response = switch (err) {
             error.MaxDepth => beam.make(.{ .@"error", .{ .js, "maximum depth exceeded" } }, .{ .env = reply_env }),
+            error.MaxResultSize => beam.make(.{ .@"error", .{ .js, "maximum result size exceeded" } }, .{ .env = reply_env }),
             error.FunctionNotSerializable => beam.make(.{ .@"error", .{ .js, "value of type 'function' is not serializable" } }, .{ .env = reply_env }),
             error.JSError => current_js_error_with_poison(ctx_res, ctx),
             error.OutOfMemory => poison_internal_error(ctx_res),
@@ -1582,7 +1675,7 @@ fn execute_register_callback(ctx_res: *JsContext, cmd: *Command) void {
     defer global.deinit(ctx);
 
     global.setPropertyStr(ctx, callback_entry.name, fn_value) catch {
-        ctx_res.poisoned = true;
+        mark_context_poisoned(ctx_res);
         send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
         return;
     };
@@ -1635,7 +1728,7 @@ fn execute_register_async_callback(ctx_res: *JsContext, cmd: *Command) void {
     defer global.deinit(ctx);
 
     global.setPropertyStr(ctx, callback_entry.name, fn_value) catch {
-        ctx_res.poisoned = true;
+        mark_context_poisoned(ctx_res);
         send_reply(cmd, reply_env, beam.make(.{ .@"error", .internal_error }, .{ .env = reply_env }));
         return;
     };
@@ -1648,7 +1741,7 @@ fn interrupt_handler(opaque_ptr: ?*JsContext, runtime: *Runtime) bool {
 
     const ctx_res = opaque_ptr orelse return false;
     ctx_res.gas_quanta_total +|= 1;
-    if (ctx_res.shutting_down) return true;
+    if (context_is_shutting_down(ctx_res)) return true;
 
     const now = std.time.milliTimestamp();
     if (now > 0 and now - ctx_res.owner_check_ms >= @as(i64, @intCast(CALLBACK_OWNER_CHECK_NS / std.time.ns_per_ms))) {
@@ -1719,6 +1812,7 @@ pub fn nif_new(memory_limit_bytes: u64, stack_limit_bytes: u64, timeout_ms: u64)
         .callback_error_env = null,
         .callback_error = null,
         .async_entries_head_ptr = 0,
+        .async_entries_count = 0,
         .async_resolution_head_ptr = 0,
         .async_resolution_tail_ptr = 0,
         .module_load_error = false,
@@ -1780,12 +1874,12 @@ fn enqueue_checked(env: beam.env, ctx_res: *JsContext, cmd: *Command) beam.term 
     ctx_res.queue_mutex.lock();
     defer ctx_res.queue_mutex.unlock();
 
-    if (ctx_res.poisoned) {
+    if (context_is_poisoned(ctx_res)) {
         destroy_command(cmd);
         return beam.make(.{ .@"error", .poisoned }, .{ .env = env });
     }
 
-    if (ctx_res.shutting_down) {
+    if (context_is_shutting_down(ctx_res)) {
         destroy_command(cmd);
         return beam.make(.{ .@"error", .poisoned }, .{ .env = env });
     }
@@ -1850,12 +1944,12 @@ fn command_context_or_error(env: beam.env, resource_ref: beam.term) union(enum) 
     };
     const ctx_res = ctx_resource.__payload;
 
-    if (ctx_res.poisoned) {
+    if (context_is_poisoned(ctx_res)) {
         ctx_resource.release();
         return .{ .err = beam.make(.{ .@"error", .poisoned }, .{ .env = env }) };
     }
 
-    if (ctx_res.shutting_down) {
+    if (context_is_shutting_down(ctx_res)) {
         ctx_resource.release();
         return .{ .err = beam.make(.{ .@"error", .poisoned }, .{ .env = env }) };
     }
@@ -2048,13 +2142,8 @@ pub fn nif_signal_callback_result(resource_ref: beam.term, request_ref: beam.ter
     defer ctx_resource.release();
     const ctx_res = ctx_resource.__payload;
 
-    if (!ctx_res.has_active_command or !is_owner(env, ctx_res.owner_pid)) {
+    if (!is_owner(env, ctx_res.owner_pid)) {
         return beam.make(.{ .@"error", .not_owner }, .{ .env = env });
-    }
-
-    const active_ref = e.enif_make_copy(env, ctx_res.active_ref_term.v);
-    if (e.enif_compare(request_ref.v, active_ref) != 0) {
-        return beam.make(.{ .@"error", .stale }, .{ .env = env });
     }
 
     const msg_env = e.enif_alloc_env();
@@ -2067,7 +2156,12 @@ pub fn nif_signal_callback_result(resource_ref: beam.term, request_ref: beam.ter
     ctx_res.callback_mutex.lock();
     defer ctx_res.callback_mutex.unlock();
 
-    if (ctx_res.callback_abort_reason != .none or ctx_res.shutting_down) {
+    if (!active_request_matches_locked(ctx_res, env, request_ref)) {
+        e.enif_free_env(msg_env);
+        return beam.make(.{ .@"error", .stale }, .{ .env = env });
+    }
+
+    if (ctx_res.callback_abort_reason != .none or context_is_shutting_down(ctx_res)) {
         e.enif_free_env(msg_env);
         return beam.make(.{ .@"error", .stale }, .{ .env = env });
     }
@@ -2098,13 +2192,8 @@ pub fn nif_signal_module_result(resource_ref: beam.term, request_ref: beam.term,
     defer ctx_resource.release();
     const ctx_res = ctx_resource.__payload;
 
-    if (!ctx_res.has_active_command or !is_owner(env, ctx_res.owner_pid)) {
+    if (!is_owner(env, ctx_res.owner_pid)) {
         return beam.make(.{ .@"error", .not_owner }, .{ .env = env });
-    }
-
-    const active_ref = e.enif_make_copy(env, ctx_res.active_ref_term.v);
-    if (e.enif_compare(request_ref.v, active_ref) != 0) {
-        return beam.make(.{ .@"error", .stale }, .{ .env = env });
     }
 
     const msg_env = e.enif_alloc_env();
@@ -2117,7 +2206,12 @@ pub fn nif_signal_module_result(resource_ref: beam.term, request_ref: beam.term,
     ctx_res.callback_mutex.lock();
     defer ctx_res.callback_mutex.unlock();
 
-    if (ctx_res.callback_abort_reason != .none or ctx_res.shutting_down) {
+    if (!active_request_matches_locked(ctx_res, env, request_ref)) {
+        e.enif_free_env(msg_env);
+        return beam.make(.{ .@"error", .stale }, .{ .env = env });
+    }
+
+    if (ctx_res.callback_abort_reason != .none or context_is_shutting_down(ctx_res)) {
         e.enif_free_env(msg_env);
         return beam.make(.{ .@"error", .stale }, .{ .env = env });
     }
@@ -2148,15 +2242,6 @@ pub fn nif_resolve_async(resource_ref: beam.term, request_ref: beam.term, req_id
     defer ctx_resource.release();
     const ctx_res = ctx_resource.__payload;
 
-    if (!ctx_res.has_active_command) {
-        return beam.make(.{ .@"error", .stale }, .{ .env = env });
-    }
-
-    const active_ref = e.enif_make_copy(env, ctx_res.active_ref_term.v);
-    if (e.enif_compare(request_ref.v, active_ref) != 0) {
-        return beam.make(.{ .@"error", .stale }, .{ .env = env });
-    }
-
     const msg_env = e.enif_alloc_env();
     if (msg_env == null) {
         return beam.make(.{ .@"error", .internal_error }, .{ .env = env });
@@ -2176,7 +2261,13 @@ pub fn nif_resolve_async(resource_ref: beam.term, request_ref: beam.term, req_id
     ctx_res.callback_mutex.lock();
     defer ctx_res.callback_mutex.unlock();
 
-    if (ctx_res.callback_abort_reason != .none or ctx_res.shutting_down) {
+    if (!active_request_matches_locked(ctx_res, env, request_ref) or !async_entry_exists_locked(ctx_res, req_id)) {
+        e.enif_free_env(msg_env);
+        beam.allocator.destroy(resolution);
+        return beam.make(.{ .@"error", .stale }, .{ .env = env });
+    }
+
+    if (ctx_res.callback_abort_reason != .none or context_is_shutting_down(ctx_res)) {
         e.enif_free_env(msg_env);
         beam.allocator.destroy(resolution);
         return beam.make(.{ .@"error", .stale }, .{ .env = env });
@@ -2277,7 +2368,7 @@ fn current_js_error_with_poison(ctx_res: *JsContext, ctx: *Context) beam.term {
     defer exc.deinit(ctx);
 
     if (exception_is_oom(ctx, exc)) {
-        ctx_res.poisoned = true;
+        mark_context_poisoned(ctx_res);
         return beam.make(.{ .@"error", .oom }, .{});
     }
 
@@ -2293,7 +2384,7 @@ fn property_set_error_term(ctx_res: *JsContext, ctx: *Context) beam.term {
     defer exc.deinit(ctx);
 
     if (exception_is_oom(ctx, exc)) {
-        ctx_res.poisoned = true;
+        mark_context_poisoned(ctx_res);
         return beam.make(.{ .@"error", .oom }, .{});
     }
 
@@ -2301,7 +2392,7 @@ fn property_set_error_term(ctx_res: *JsContext, ctx: *Context) beam.term {
 }
 
 fn poison_internal_error(ctx_res: *JsContext) beam.term {
-    ctx_res.poisoned = true;
+    mark_context_poisoned(ctx_res);
     return beam.make(.{ .@"error", .internal_error }, .{});
 }
 
@@ -2324,10 +2415,21 @@ fn erl_to_js_error_term(ctx_res: *JsContext, ctx: *Context, err: anyerror) beam.
     };
 }
 
-fn js_to_erl(env: beam.env, ctx: *Context, val: Value, depth: u32) error{ MaxDepth, FunctionNotSerializable, JSError, OutOfMemory }!beam.term {
+fn consume_result_budget(budget: *usize, amount: usize) error{MaxResultSize}!void {
+    if (amount > budget.*) return error.MaxResultSize;
+    budget.* -= amount;
+}
+
+fn js_to_erl(env: beam.env, ctx: *Context, val: Value, depth: u32) error{ MaxDepth, MaxResultSize, FunctionNotSerializable, JSError, OutOfMemory }!beam.term {
+    var budget: usize = MAX_RESULT_NODE_COUNT;
+    return js_to_erl_limited(env, ctx, val, depth, &budget);
+}
+
+fn js_to_erl_limited(env: beam.env, ctx: *Context, val: Value, depth: u32, budget: *usize) error{ MaxDepth, MaxResultSize, FunctionNotSerializable, JSError, OutOfMemory }!beam.term {
     _ = Atom;
 
     if (depth >= MAX_MARSHAL_DEPTH) return error.MaxDepth;
+    try consume_result_budget(budget, 1);
 
     if (val.isNull() or val.isUndefined()) {
         return beam.make(null, .{ .env = env });
@@ -2377,6 +2479,7 @@ fn js_to_erl(env: beam.env, ctx: *Context, val: Value, depth: u32) error{ MaxDep
 
         const length_u32 = length_value.toUint32(ctx) catch return error.JSError;
         const length: usize = @intCast(length_u32);
+        if (length > MAX_RESULT_ARRAY_LENGTH or length > budget.*) return error.MaxResultSize;
 
         var list_items = try beam.allocator.alloc(beam.term, length);
         defer beam.allocator.free(list_items);
@@ -2387,7 +2490,7 @@ fn js_to_erl(env: beam.env, ctx: *Context, val: Value, depth: u32) error{ MaxDep
 
             if (item.isException()) return error.JSError;
 
-            list_items[index] = try js_to_erl(env, ctx, item, depth + 1);
+            list_items[index] = try js_to_erl_limited(env, ctx, item, depth + 1, budget);
         }
 
         return beam.make(list_items, .{ .env = env });
@@ -2400,6 +2503,7 @@ fn js_to_erl(env: beam.env, ctx: *Context, val: Value, depth: u32) error{ MaxDep
     if (val.isObject()) {
         const props = val.getOwnPropertyNames(ctx, .enum_strings) catch return error.JSError;
         defer Value.freePropertyEnum(ctx, props);
+        if (props.len > MAX_RESULT_OBJECT_PROPERTIES or props.len > budget.*) return error.MaxResultSize;
 
         var map_term: beam.term = .{ .v = e.enif_make_new_map(env) };
 
@@ -2414,7 +2518,7 @@ fn js_to_erl(env: beam.env, ctx: *Context, val: Value, depth: u32) error{ MaxDep
 
             if (item.isException()) return error.JSError;
 
-            const item_term = try js_to_erl(env, ctx, item, depth + 1);
+            const item_term = try js_to_erl_limited(env, ctx, item, depth + 1, budget);
 
             var updated_map: e.ErlNifTerm = undefined;
             if (e.enif_make_map_put(env, map_term.v, key_term.v, item_term.v, &updated_map) == 0) {

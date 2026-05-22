@@ -1,10 +1,10 @@
 # QuickjsEx
 
-QuickjsEx embeds the QuickJS-NG engine in Elixir through Zig NIFs, without Node.js, and executes modern JavaScript (ES2023) inside a sandboxed runtime.
+QuickjsEx embeds the QuickJS-NG engine in Elixir through Zig NIFs, without Node.js, and executes modern JavaScript (ES2023) inside an in-process sandboxed runtime.
 
 ## What it is
 
-QuickjsEx embeds the QuickJS-NG JavaScript engine directly inside the BEAM, targeting modern ES2023 without a Node.js dependency. It is implemented with Zig/Zigler NIFs and executes callbacks directly in the calling process.
+QuickjsEx embeds the QuickJS-NG JavaScript engine directly inside the BEAM, targeting modern ES2023 without a Node.js dependency. It is implemented with Zig/Zigler NIFs and executes callbacks directly in the calling process. It is not an OS sandbox; do not treat it as isolation for adversarial JavaScript without an outer process, container, VM, or similar boundary.
 
 ## Execution model
 
@@ -37,6 +37,7 @@ QuickjsEx requires Zig `0.15.2` on your `PATH`:
 ```elixir
 {:ok, ctx} = QuickjsEx.new(timeout: 100)
 {:ok, 42} = QuickjsEx.eval(ctx, "40 + 2")
+# evals without a per-call :timeout use the context default.
 ```
 
 ### 2) `get/2` + `set/3` with a scalar value
@@ -139,6 +140,10 @@ end
 JavaScript callback requests in the Server mailbox. Server callbacks are
 promise-capable from JavaScript and can return `{:reply, value, state}` or defer
 with `{:noreply, state}` plus `QuickjsEx.Server.resolve/2` or `reject/2`.
+The Server queue is bounded by `:max_queue_size`; pass `on_busy: :error` to
+reject work instead of queueing behind an active eval. Server evals default to a
+finite JavaScript timeout of `5_000` ms; pass `timeout: 0` only when unbounded JS
+execution is intentional.
 
 See [docs/server.md](docs/server.md) for deferred callbacks, `eval_async/3`,
 module loaders, API state namespaces, and gas accounting.
@@ -149,7 +154,9 @@ module loaders, API state namespaces, and gas accounting.
 | --- | --- | --- | --- |
 | `:memory_limit` | integer | `4_000_000` | Runtime heap limit in bytes. |
 | `:stack_limit` | integer | `1_048_576` | QuickJS soft stack limit in bytes; the context thread requests an OS stack with headroom above this value. |
-| `:timeout` | integer | `0` | Default evaluation timeout in milliseconds (`0` disables limit). |
+| `:timeout` | integer | `0` | Default evaluation timeout in milliseconds (`0` disables limit). Per-call eval options override this value. |
+
+Invalid `:memory_limit`, `:stack_limit`, or `:timeout` values return `{:error, {:invalid_option, option, message}}` before the NIF is called.
 
 ## Error contract
 
@@ -167,8 +174,14 @@ Operations that return `{:error, reason}` normalize engine failures into typed c
 - `{:js_error, message}` - JavaScript raised an exception.
 - `{:callback_error, callback_name, message}` - an Elixir callback failed while invoked from JavaScript.
 - `{:invalid_api_module, message}` - `load_api/3` received an invalid API module contract.
+- `{:invalid_option, option_name, message}` - an option failed validation before reaching the NIF.
 
-## Sandbox guarantees
+## Sandbox guarantees and limits
+
+QuickjsEx removes common host capabilities from the embedded JavaScript global
+object, but the runtime remains in the BEAM OS process. Memory bugs in native
+code, CPU pressure, and other in-process failure modes are not equivalent to
+OS-level isolation.
 
 Capability guarantees:
 
@@ -194,6 +207,17 @@ Capability guarantees:
   - `setTimeout`
   - `print`
 - Only values and callbacks explicitly injected through `QuickjsEx` are available.
+
+Module loaders receive JavaScript-controlled specifiers. Loader examples should
+deny by default, as above. Avoid direct `File.read/1`, HTTP fetches, or package
+resolution from untrusted specifiers unless you add an explicit allowlist and
+path normalization.
+
+`get/2` returns `{:ok, nil}` for missing globals, JavaScript `undefined`, and
+JavaScript `null`.
+
+Direct `QuickjsEx.load_api/3` rejects stateful `defjs` callbacks. Use
+`QuickjsEx.Server` for stateful API modules and per-API state slices.
 
 Security validation:
 

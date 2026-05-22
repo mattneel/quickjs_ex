@@ -25,6 +25,7 @@ defmodule QuickjsEx.Context do
     module_loader: nil,
     loaded_apis: [],
     private: %{},
+    default_timeout: 0,
     poisoned?: false
   ]
 
@@ -35,6 +36,7 @@ defmodule QuickjsEx.Context do
           module_loader: function() | nil,
           loaded_apis: [module()],
           private: map(),
+          default_timeout: non_neg_integer(),
           poisoned?: boolean()
         }
 
@@ -46,6 +48,16 @@ defmodule QuickjsEx.Context do
   @spec new(reference()) :: t()
   def new(ref) when is_reference(ref) do
     %__MODULE__{ref: ref}
+  end
+
+  @doc """
+  Creates a new Context struct with a default eval timeout.
+
+  Called internally by `QuickjsEx.new/1`.
+  """
+  @spec new(reference(), non_neg_integer()) :: t()
+  def new(ref, default_timeout) when is_reference(ref) and is_integer(default_timeout) do
+    %__MODULE__{ref: ref, default_timeout: default_timeout}
   end
 
   @doc """

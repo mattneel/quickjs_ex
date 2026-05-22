@@ -893,6 +893,19 @@ defmodule QuickjsExTest do
   end
 
   describe "timeout" do
+    test "new timeout becomes the default eval timeout" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory, timeout: 10)
+
+      assert {:error, :timeout} = QuickjsEx.eval(ctx, "while(true) {}")
+      assert {:ok, 42} = QuickjsEx.eval(ctx, "42")
+    end
+
+    test "per-call timeout overrides the context default" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory, timeout: 10)
+
+      assert {:ok, 4} = QuickjsEx.eval(ctx, "2 + 2", timeout: 0)
+    end
+
     test "interrupts infinite loop and context remains usable" do
       {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
       assert {:error, :timeout} = QuickjsEx.eval(ctx, "while(true) {}", timeout: 100)
@@ -915,6 +928,122 @@ defmodule QuickjsExTest do
 
       assert {:ok, 42} =
                QuickjsEx.eval(ctx, "blocking_host_io() + 1", timeout: 50)
+    end
+  end
+
+  describe "new option validation" do
+    test "invalid memory, stack, and timeout options return error tuples" do
+      for option <- [:memory_limit, :stack_limit, :timeout] do
+        assert {:error, {:invalid_option, ^option, message}} = QuickjsEx.new([{option, -1}])
+        assert message =~ "non-negative integer"
+      end
+    end
+  end
+
+  describe "runtime bootstrap" do
+    test "new returns an error when bootstrap fails" do
+      assert {:error, _reason} = QuickjsEx.new(memory_limit: 110_000)
+    end
+
+    test "bootstrap installs console.log on normal contexts" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:ok, "function"} = QuickjsEx.eval(ctx, "typeof console.log")
+    end
+  end
+
+  describe "result marshalling limits" do
+    test "huge sparse arrays are rejected without poisoning the context" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:error, {:js_error, message}} =
+               QuickjsEx.eval(ctx, "let a = []; a.length = 0xffffffff; a")
+
+      assert message =~ "maximum result size exceeded"
+      assert {:ok, 42} = QuickjsEx.eval(ctx, "42")
+    end
+
+    test "normal arrays still marshal successfully" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      assert {:ok, [1, 2, 3]} = QuickjsEx.eval(ctx, "[1, 2, 3]")
+    end
+
+    test "objects with too many properties are rejected" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: 4_000_000)
+
+      assert {:error, {:js_error, message}} =
+               QuickjsEx.eval(ctx, """
+               let o = {};
+               for (let i = 0; i < 11000; i++) {
+                 o["k" + i] = i;
+               }
+               o;
+               """)
+
+      assert message =~ "maximum result size exceeded"
+      assert {:ok, "usable"} = QuickjsEx.eval(ctx, "'usable'")
+    end
+  end
+
+  describe "async callback fan-out limits" do
+    test "too many pending async host callbacks reject and leave the context usable" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: 4_000_000)
+      {:ok, ctx} = QuickjsEx.set_async(ctx, :host_async, fn [value] -> value end)
+
+      assert {:ok, message} =
+               QuickjsEx.eval(ctx, """
+               (async () => {
+                 let promises = [];
+                 for (let i = 0; i < 128; i++) {
+                   promises.push(host_async(i));
+                 }
+
+                 try {
+                   await Promise.all(promises);
+                   return "all resolved";
+                 } catch (e) {
+                   return "rejected: " + String(e && e.message ? e.message : e);
+                 }
+               })()
+               """)
+
+      assert message =~ "maximum pending async callbacks exceeded"
+      assert {:ok, 42} = QuickjsEx.eval(ctx, "42")
+    end
+
+    test "small async host callback fan-out still succeeds" do
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+      {:ok, ctx} = QuickjsEx.set_async(ctx, :host_async, fn [value] -> value + 1 end)
+
+      assert {:ok, [2, 3, 4]} =
+               QuickjsEx.eval(ctx, """
+               (async () => Promise.all([host_async(1), host_async(2), host_async(3)]))()
+               """)
+    end
+
+    test "stale async host resolutions after eval completion are ignored" do
+      parent = self()
+      {:ok, ctx} = QuickjsEx.new(memory_limit: @default_memory)
+
+      {:ok, ctx} =
+        QuickjsEx.set_async(ctx, :late_async, fn [value] ->
+          send(parent, {:late_async_started, self()})
+
+          receive do
+            :resolve -> value
+          after
+            1_000 -> value
+          end
+        end)
+
+      assert {:ok, 42} = QuickjsEx.eval(ctx, "late_async(41); 42")
+      assert_receive {:late_async_started, worker}, 1_000
+
+      send(worker, :resolve)
+      Process.sleep(25)
+
+      assert {:ok, 43} = QuickjsEx.eval(ctx, "43")
     end
   end
 

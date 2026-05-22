@@ -35,18 +35,18 @@ defmodule QuickjsEx.API do
 
       # Call as: utils.math.add(1, 2)
 
-  ## Accessing State
+  ## Stateful APIs
 
-  To access or modify the JavaScript context state, use the three-argument form:
+  The three-argument `defjs` form records that a callback needs state:
 
       defjs get_config(key), state do
-        QuickjsEx.get!(state, [key])
+        Map.fetch!(state, key)
       end
 
-      defjs set_config(key, value), state do
-        new_state = QuickjsEx.set!(state, [key], value)
-        {nil, new_state}  # Return {result, new_state} to modify state
-      end
+  Stateful `defjs` callbacks are supported by `QuickjsEx.Server`, which invokes
+  `handle_js_call/3` with an isolated state slice for each API. Direct
+  `QuickjsEx.load_api/3` rejects stateful API modules at load time because a
+  raw context has no API state owner.
 
   ## Variadic Functions
 
@@ -86,6 +86,10 @@ defmodule QuickjsEx.API do
       def install(_ctx, _scope, _data) do
         "var API_VERSION = 1;"
       end
+
+  Returning any other value is reported as `{:invalid_api_module, message}`.
+  JavaScript failures while evaluating install code are returned as their
+  normalized runtime errors, such as `{:js_error, message}`.
   """
 
   alias QuickjsEx.Context
@@ -97,7 +101,10 @@ defmodule QuickjsEx.API do
 
   @doc "Optional callback run when the API is loaded"
   @callback install(QuickjsEx.Context.t(), scope_def(), any()) ::
-              QuickjsEx.Context.t() | String.t()
+              QuickjsEx.Context.t()
+              | String.t()
+              | {:ok, QuickjsEx.Context.t()}
+              | {:error, term()}
 
   @optional_callbacks [install: 3]
 
@@ -258,19 +265,50 @@ defmodule QuickjsEx.API do
     if function_exported?(module, :install, 3) do
       case module.install(ctx, scope, data) do
         %Context{} = new_ctx ->
-          new_ctx
+          {:ok, new_ctx}
+
+        {:ok, %Context{} = new_ctx} ->
+          {:ok, new_ctx}
+
+        {:error, reason} ->
+          {:error, reason}
 
         code when is_binary(code) ->
-          {_, new_ctx} = QuickjsEx.eval!(ctx, code)
-          new_ctx
+          case QuickjsEx.eval(ctx, code) do
+            {:ok, _result} -> {:ok, ctx}
+            {:error, reason} -> {:error, reason}
+          end
 
         other ->
-          raise QuickjsEx.RuntimeException,
-                {:invalid_api_module,
-                 "install/3 must return Context or JS code string, got #{inspect(other)}"}
+          {:error,
+           {:invalid_api_module,
+            "install/3 must return Context, {:ok, Context}, {:error, reason}, or JS code string, got #{inspect(other)}"}}
       end
     else
-      ctx
+      {:ok, ctx}
     end
+  rescue
+    e in QuickjsEx.RuntimeException ->
+      {:error, runtime_exception_reason(e)}
   end
+
+  defp runtime_exception_reason(%QuickjsEx.RuntimeException{
+         category: :js_error,
+         detail: %{message: message}
+       }),
+       do: {:js_error, message}
+
+  defp runtime_exception_reason(%QuickjsEx.RuntimeException{
+         category: :callback_error,
+         detail: %{callback_name: name, message: message}
+       }),
+       do: {:callback_error, name, message}
+
+  defp runtime_exception_reason(%QuickjsEx.RuntimeException{
+         category: :invalid_api_module,
+         detail: %{message: message}
+       }),
+       do: {:invalid_api_module, message}
+
+  defp runtime_exception_reason(%QuickjsEx.RuntimeException{category: category}), do: category
 end

@@ -1,7 +1,8 @@
 defmodule QuickjsEx do
   @moduledoc """
   QuickjsEx embeds the QuickJS-NG engine in Elixir through Zig NIFs, without Node.js,
-  and executes modern JavaScript (ES2023) inside a sandboxed runtime.
+  and executes modern JavaScript (ES2023) inside an in-process sandboxed runtime.
+  This is an embedding boundary, not OS-level isolation for adversarial code.
 
   ## Quick start
 
@@ -35,6 +36,7 @@ defmodule QuickjsEx do
   @poisoned_ref_key {__MODULE__, :poisoned_ref}
   @callback_aliases_key {__MODULE__, :callback_aliases}
   @default_stack_limit 1024 * 1024
+  @max_u64 18_446_744_073_709_551_615
   @bootstrap_min_memory 64 * 1024
   @runtime_bootstrap """
   (function () {
@@ -57,7 +59,7 @@ defmodule QuickjsEx do
   | --- | --- | --- | --- |
   | `:memory_limit` | integer | `4_000_000` | Runtime heap limit in bytes. |
   | `:stack_limit` | integer | `1_048_576` | QuickJS soft stack limit in bytes; the context thread requests an OS stack with headroom above this value. |
-  | `:timeout` | integer | `0` | Default evaluation timeout in milliseconds (`0` disables timeout). |
+  | `:timeout` | integer | `0` | Default evaluation timeout in milliseconds (`0` disables timeout). Per-call eval options can override it. |
 
   ## Returns
 
@@ -75,6 +77,7 @@ defmodule QuickjsEx do
     - `{:js_error, message}`
     - `{:callback_error, callback_name, message}`
     - `{:invalid_api_module, message}`
+    - `{:invalid_option, option_name, message}`
     - any other passthrough error term
 
   ## Examples
@@ -89,20 +92,27 @@ defmodule QuickjsEx do
     stack_limit = Keyword.get(opts, :stack_limit, @default_stack_limit)
     timeout = Keyword.get(opts, :timeout, 0)
 
-    case NIF.nif_new(memory_limit, stack_limit, timeout) do
-      {:ok, ref} ->
-        clear_poisoned_ref(ref)
+    with :ok <- validate_new_option(:memory_limit, memory_limit),
+         :ok <- validate_new_option(:stack_limit, stack_limit),
+         :ok <- validate_new_option(:timeout, timeout) do
+      case NIF.nif_new(memory_limit, stack_limit, timeout) do
+        {:ok, ref} ->
+          clear_poisoned_ref(ref)
 
-        ctx =
-          ref
-          |> Context.new()
-          |> sync_poisoned_context()
+          ctx =
+            ref
+            |> Context.new(timeout)
+            |> sync_poisoned_context()
 
-        maybe_bootstrap_runtime(ctx, memory_limit)
-        {:ok, ctx}
+          with :ok <- maybe_bootstrap_runtime(ctx, memory_limit) do
+            {:ok, ctx}
+          end
 
-      {:error, reason} ->
-        {:error, normalise_error(reason)}
+        {:error, reason} ->
+          {:error, normalise_error(reason)}
+      end
+    else
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -111,7 +121,8 @@ defmodule QuickjsEx do
 
   Accepts `ctx`, a JavaScript source string, and optional `opts`:
 
-  - `:timeout` - evaluation timeout in milliseconds for this call (`0` disables timeout)
+  - `:timeout` - evaluation timeout in milliseconds for this call (`0` disables timeout);
+    when omitted, the context default from `new/1` is used
 
   Contexts remain reusable after JavaScript exceptions (`{:js_error, message}`).
   Recreate the context after non-recoverable errors like `:oom` or `:internal_error`.
@@ -148,7 +159,7 @@ defmodule QuickjsEx do
     if context_poisoned?(ctx) do
       {:error, :context_poisoned}
     else
-      timeout = Keyword.get(opts, :timeout, 0)
+      timeout = Keyword.get(opts, :timeout, ctx.default_timeout)
       eval_as_module? = Keyword.get(opts, :type, :script) == :module
 
       request_ref = make_ref()
@@ -243,10 +254,13 @@ defmodule QuickjsEx do
   Reads a JavaScript global value by name.
 
   `name` can be an atom or string.
+  Missing globals, JavaScript `undefined`, and JavaScript `null` all return
+  `{:ok, nil}` because QuickJS exposes them as non-error values at this API
+  boundary.
 
   ## Returns
 
-  - `{:ok, value}` when the global exists and can be converted.
+  - `{:ok, value}` when the global can be converted.
   - `{:error, reason}` when access fails, where `reason` is one of:
     - `:timeout`
     - `:oom`
@@ -269,7 +283,7 @@ defmodule QuickjsEx do
       iex> {:ok, 42} = QuickjsEx.get(ctx, :answer)
 
       iex> {:ok, ctx} = QuickjsEx.new()
-      iex> {:error, {:js_error, _message}} = QuickjsEx.get(ctx, "missing.value")
+      iex> {:ok, nil} = QuickjsEx.get(ctx, :missing)
   """
   def get(%Context{} = ctx, name) when is_atom(name) or is_binary(name) do
     if context_poisoned?(ctx) do
@@ -310,12 +324,7 @@ defmodule QuickjsEx do
       iex> 42 = QuickjsEx.get!(ctx, :answer)
 
       iex> {:ok, ctx} = QuickjsEx.new()
-      iex> try do
-      ...>   QuickjsEx.get!(ctx, "missing.value")
-      ...> rescue
-      ...>   e in QuickjsEx.RuntimeException -> e.category
-      ...> end
-      :js_error
+      iex> nil = QuickjsEx.get!(ctx, :missing)
   """
   def get!(%Context{} = ctx, name) when is_atom(name) or is_binary(name) do
     case get(ctx, name) do
@@ -543,7 +552,8 @@ defmodule QuickjsEx do
   Loads a `QuickjsEx.API` module into a context.
 
   The module must implement `scope/0` and `__js_functions__/0` as provided by
-  `use QuickjsEx.API`.
+  `use QuickjsEx.API`. Direct contexts reject stateful `defjs` callbacks; use
+  `QuickjsEx.Server` for APIs that need per-call state slices.
 
   ## Returns
 
@@ -578,29 +588,17 @@ defmodule QuickjsEx do
       iex> {:error, {:invalid_api_module, _message}} = QuickjsEx.load_api(ctx, String)
   """
   def load_api(%Context{} = ctx, module, data \\ nil) when is_atom(module) do
-    try do
-      scope = module.scope()
-      functions = module.__js_functions__()
-
-      case register_api_callbacks(ctx, module, scope, functions) do
-        {:ok, callbacks_ctx} ->
-          installed_ctx =
-            callbacks_ctx
-            |> Context.add_loaded_api(module)
-            |> QuickjsEx.API.install(module, scope, data)
-            |> sync_poisoned_context()
-
-          {:ok, installed_ctx}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-    rescue
-      e in UndefinedFunctionError ->
-        {:error, normalise_error({:invalid_api_module, Exception.message(e)})}
-
-      e in RuntimeException ->
-        {:error, normalise_error({:invalid_api_module, Exception.message(e)})}
+    with {:ok, scope, functions} <- fetch_api_metadata(module),
+         :ok <- reject_stateful_direct_api(functions),
+         {:ok, callbacks_ctx} <- register_api_callbacks(ctx, module, scope, functions),
+         {:ok, installed_ctx} <-
+           callbacks_ctx
+           |> Context.add_loaded_api(module)
+           |> QuickjsEx.API.install(module, scope, data) do
+      {:ok, sync_poisoned_context(installed_ctx)}
+    else
+      {:error, reason} ->
+        {:error, normalise_error(reason)}
     end
   end
 
@@ -947,15 +945,6 @@ defmodule QuickjsEx do
 
   defp build_callback_path(scope, name), do: scope ++ [to_string(name)]
 
-  defp build_callback_fun(_module, name, true, _variadic) do
-    fn _args ->
-      raise QuickjsEx.RuntimeException,
-            {:callback_error, to_string(name),
-             "stateful defjs callbacks (with state parameter) are not supported in v0.1; " <>
-               "use QuickjsEx.get_private/put_private for shared state instead"}
-    end
-  end
-
   defp build_callback_fun(module, name, false, false) do
     fn args ->
       apply(module, name, args)
@@ -965,6 +954,34 @@ defmodule QuickjsEx do
   defp build_callback_fun(module, name, false, true) do
     fn args ->
       apply(module, name, [args])
+    end
+  end
+
+  defp fetch_api_metadata(module) do
+    {:ok, module.scope(), module.__js_functions__()}
+  rescue
+    e in UndefinedFunctionError ->
+      {:error, {:invalid_api_module, Exception.message(e)}}
+
+    e ->
+      {:error, {:invalid_api_module, Exception.message(e)}}
+  end
+
+  defp reject_stateful_direct_api(functions) do
+    stateful_names =
+      functions
+      |> Enum.filter(fn {_name, uses_state, _variadic} -> uses_state end)
+      |> Enum.map(fn {name, _uses_state, _variadic} -> to_string(name) end)
+
+    case stateful_names do
+      [] ->
+        :ok
+
+      names ->
+        {:error,
+         {:invalid_api_module,
+          "stateful defjs callbacks are only supported by QuickjsEx.Server; " <>
+            "direct QuickjsEx.load_api/3 cannot load: #{Enum.join(names, ", ")}"}}
     end
   end
 
@@ -1054,11 +1071,24 @@ defmodule QuickjsEx do
 
   defp maybe_bootstrap_runtime(ctx, memory_limit)
        when is_integer(memory_limit) and memory_limit >= @bootstrap_min_memory do
-    _ = eval(ctx, @runtime_bootstrap)
-    :ok
+    case eval(ctx, @runtime_bootstrap) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp maybe_bootstrap_runtime(_ctx, _memory_limit), do: :ok
+
+  defp validate_new_option(option, value)
+       when is_integer(value) and value >= 0 and value <= @max_u64 do
+    _ = option
+    :ok
+  end
+
+  defp validate_new_option(option, _value) do
+    {:error,
+     {:invalid_option, option, "must be a non-negative integer within unsigned 64-bit range"}}
+  end
 
   defp remember_callback_alias(%Context{} = ctx, callback_name, public_name) do
     aliases =
